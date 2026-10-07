@@ -1,0 +1,46 @@
+{
+  "Train_MATH_3B_GRPO_KL.py": {
+    "source": "ProjectII_Merging_clean/Trainning_GRPO_with_KL_MATH.py",
+    "source_sha256": "85666db2217df0fc10179e7811e494b2ec8620d9169dd95adc641699b54448cf"
+  },
+  "Train_MATH_3B_Fixed.py": {
+    "source": "ProjectII_Merging_clean/Main_fixed_MATH.py",
+    "source_sha256": "628976434a285c5a2c85f5b57722ab2603f75a3f8679346760a781e86b2c9cf9"
+  },
+  "Train_MATH_3B_Adaptive.py": {
+    "source": "ProjectII_Merging_clean/Main_MATH.py",
+    "source_sha256": "1936e96504f15d47a15d3b1007da0de663c69ad497871b96523a072fd21e3f57"
+  },
+  "math3b_support/SFT_policy.py": {
+    "source": "ProjectII_Merging_clean/SFT_policy.py",
+    "source_sha256": "45c507ebad94a089f1069174847cad0124f0000591ba4a3f048c2a4706344964"
+  },
+  "math3b_support/adapters.py": {
+    "source": "tests/adapters.py",
+    "source_sha256": "555a3ec3d6744b78027517e058057ca340ddb2fe765554f2dd7a797e303355b6"
+  },
+  "math3b_support/drgrpo_grader.py": {
+    "source": "cs336_alignment/drgrpo_grader.py",
+    "source_sha256": "62b262a350fde906804052890aaec466a7a1bd1d259ce7f2cf701d5810f336d8"
+  },
+  "math3b_support/math_baseline.py": {
+    "source": "cs336_alignment/math_baseline.py",
+    "source_sha256": "b93fbadc0c644b4684ea9f2d185c40c1ae6bf868802bef4a3e851d22286c1462"
+  },
+  "pyproject.toml": {
+    "source": "pyproject.toml",
+    "source_sha256": "3d62d9ddbfe6c11a4fc7cfa09228b211266b656bab7ebd8bfde451be4c779e8b"
+  },
+  "uv.lock": {
+    "source": "uv.lock",
+    "source_sha256": "598ed4ccf5c06606d319f0b60aef3295c09a0f8339e3f6b2505f7c2c301b352b"
+  },
+  ".python-version": {
+    "source": ".python-version",
+    "source_sha256": "7b55f8e67b5623c4bef3fa691288da9437d79d3aba156de48d481db32ac7d16d"
+  },
+  "Train_MATH_3B_SFT.py": {
+    "source": "ProjectII_Merging_clean/SFT_policy_MATH.py",
+    "source_sha256": "45c507ebad94a089f1069174847cad0124f0000591ba4a3f048c2a4706344964"
+  }
+}
