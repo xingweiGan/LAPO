@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from typing import Any, Callable, Literal, TYPE_CHECKING
 
 import torch
@@ -531,6 +532,7 @@ def run_grpo_microbatch_train_step(
     cliprange: float | None = None,
     normalization="mean",
     beta: float | None = None,
+    profile_phase: Callable[[str], Any] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the policy gradient loss and backprop its gradients for a microbatch.
 
@@ -555,39 +557,50 @@ def run_grpo_microbatch_train_step(
         constant_normalize_factor: int | None, provided if we want to sum over 
             the sequence dimension and normalize by this constant factor
             (as in Dr. GRPO).
+        profile_phase: Optional context-manager factory used to measure the
+            loss reduction and backward pass separately. The default adds no
+            profiler dependency and preserves existing call sites.
 
     Returns:
         tuple[torch.Tensor, dict[str, torch.Tensor]]: 
             the policy gradient loss and its metadata.
     """
- # 1) per-token loss via the wrapper
-    per_token_loss, md = run_compute_policy_gradient_loss(
-        policy_log_probs=policy_log_probs,
-        loss_type=loss_type,
-        raw_rewards=raw_rewards,
-        advantages=advantages,
-        old_log_probs=old_log_probs,
-        ref_log_probs=ref_log_probs,
-        cliprange=cliprange if cliprange is not None else 0.0,
-        beta=beta if beta is not None else 0.0,
-    )  # shape: (B, T)
+    phase = profile_phase or (lambda _name: nullcontext())
 
-    # 2) reduce to per-example/sequence scalar with masked mean over tokens
-    #    (mask==1 positions included)
-    if normalization == "mean":
-        per_example_loss = run_masked_mean(per_token_loss, response_mask, dim=1)
-    elif normalization == "normalize":
-        max_gen_len = response_mask.shape[1]
-        per_example_loss = run_masked_normalize(per_token_loss, response_mask, dim=1, normalize_constant=max_gen_len)
+    with phase("loss"):
+        # 1) per-token loss via the wrapper
+        per_token_loss, md = run_compute_policy_gradient_loss(
+            policy_log_probs=policy_log_probs,
+            loss_type=loss_type,
+            raw_rewards=raw_rewards,
+            advantages=advantages,
+            old_log_probs=old_log_probs,
+            ref_log_probs=ref_log_probs,
+            cliprange=cliprange if cliprange is not None else 0.0,
+            beta=beta if beta is not None else 0.0,
+        )  # shape: (B, T)
 
-    # 3) average over batch
-    loss = per_example_loss.mean()  # scalar
+        # 2) reduce to per-example/sequence scalar with masked mean over tokens
+        #    (mask==1 positions included)
+        if normalization == "mean":
+            per_example_loss = run_masked_mean(per_token_loss, response_mask, dim=1)
+        elif normalization == "normalize":
+            max_gen_len = response_mask.shape[1]
+            per_example_loss = run_masked_normalize(
+                per_token_loss,
+                response_mask,
+                dim=1,
+                normalize_constant=max_gen_len,
+            )
+        else:
+            raise ValueError(f"Unsupported normalization: {normalization}")
 
-    # 4) scale for gradient accumulation and backprop
-    loss = loss / float(gradient_accumulation_steps)
+        # 3) average over batch and scale for gradient accumulation
+        loss = per_example_loss.mean() / float(gradient_accumulation_steps)
 
-    # 5) backprop to accumulate gradients on policy_log_probs (or upstream params)
-    loss.backward()
+    # 4) backprop to accumulate gradients on policy_log_probs (or upstream params)
+    with phase("backward"):
+        loss.backward()
 
     # 6) return a detached scalar (for logging) and metadata
     metadata = {"loss_type": torch.tensor(0), **{k: v for k, v in md.items()}}

@@ -39,6 +39,8 @@ from math3b_support.drgrpo_grader import r1_zero_reward_fn  # noqa: E402
 from math3b_support.math_baseline import (  # noqa: E402
     r1_prompts_from_train,
 )
+from math3b_support.profiling import StageProfiler  # noqa: E402
+
 # Import the bundled SFT helpers.
 from math3b_support.SFT_policy import (  # noqa: E402
     init_vllm,
@@ -218,6 +220,7 @@ def _mixed_generate_batch_fast(
     temperature: float,
     stop_sequences: Sequence[str],
     batch_size: int = 32,
+    show_progress: bool = True,
 ) -> List[str]:
     """Generate from the mixed policy (policy + SFT) using batched KV-cached
     decoding.  Processes *batch_size* prompts at a time for ~20-30x speedup
@@ -321,11 +324,12 @@ def _mixed_generate_batch_fast(
                     break
             all_outputs.append(decoded)
 
-        print(
-            f"[AdaptiveWeight] Finished mixed-gen batch "
-            f"{batch_start + B}/{len(prompts)}",
-            flush=True,
-        )
+        if show_progress:
+            print(
+                f"[AdaptiveWeight] Finished mixed-gen batch "
+                f"{batch_start + B}/{len(prompts)}",
+                flush=True,
+            )
 
     return all_outputs
 
@@ -340,6 +344,7 @@ def _frozen_generate_batch_fast(
     temperature: float,
     stop_sequences: Sequence[str],
     batch_size: int = 32,
+    show_progress: bool = True,
 ) -> List[str]:
     """Generate once from the frozen reference model with KV caching."""
     all_outputs: List[str] = []
@@ -439,11 +444,12 @@ def _frozen_generate_batch_fast(
                     break
             all_outputs.append(decoded)
 
-        print(
-            f"[ValWeightedAdaptive] Finished frozen-reference batch "
-            f"{batch_start + batch_len}/{len(prompts)}",
-            flush=True,
-        )
+        if show_progress:
+            print(
+                f"[ValWeightedAdaptive] Finished frozen-reference batch "
+                f"{batch_start + batch_len}/{len(prompts)}",
+                flush=True,
+            )
 
     return all_outputs
 
@@ -459,6 +465,7 @@ def _vllm_policy_generate(
     max_new_tokens: int,
     min_new_tokens: int,
     stop_sequences: Sequence[str],
+    show_progress: bool = True,
 ) -> List[str]:
     """Generate from policy only using vLLM (batched, very fast)."""
     params = SamplingParams(
@@ -469,7 +476,7 @@ def _vllm_policy_generate(
         stop=list(stop_sequences),
         include_stop_str_in_output=True,
     )
-    raw_outputs = llm.generate(prompts, params)
+    raw_outputs = llm.generate(prompts, params, use_tqdm=show_progress)
     results: List[str] = []
     for out in raw_outputs:
         text = out.outputs[0].text if out.outputs else ""
@@ -565,7 +572,46 @@ def main() -> None:
     parser.add_argument("--wandb_api_key", default=os.environ.get("WANDB_API_KEY"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Record synchronized phase timings and per-GPU memory statistics.",
+    )
+    parser.add_argument(
+        "--profile-output",
+        type=Path,
+        default=None,
+        help="Profiling JSON path (default: profiles/<run_name>.json).",
+    )
+    parser.add_argument(
+        "--profile-no-nvml",
+        action="store_true",
+        help="Disable optional NVML physical-memory sampling.",
+    )
+    parser.add_argument(
+        "--profile-nvml-interval-ms",
+        type=float,
+        default=50.0,
+        help="NVML sampling interval in milliseconds (minimum: 10).",
+    )
+    parser.add_argument(
+        "--profile-full-param-check",
+        action="store_true",
+        help=(
+            "Keep the expensive full GPU-to-CPU parameter update check during "
+            "profiling; by default profiling retains only the 8-value sample check."
+        ),
+    )
     args = parser.parse_args()
+    if (
+        args.profile
+        and not args.profile_no_nvml
+        and (
+            not math.isfinite(args.profile_nvml_interval_ms)
+            or args.profile_nvml_interval_ms < 10.0
+        )
+    ):
+        parser.error("--profile-nvml-interval-ms must be finite and at least 10")
     hf_username = os.environ["HF_USERNAME"]
     _set_reproducibility(seed=args.seed, deterministic=args.deterministic)
     assert rollout_batch_size % group_size == 0, "rollout_batch_size must be divisible by group_size"
@@ -649,6 +695,29 @@ def main() -> None:
             "val_pool_size": n_grpo_steps * val_size,
         },
     )
+    profile_output = args.profile_output
+    if profile_output is None:
+        profile_output = PROJECT_ROOT / "profiles" / f"{run_name}.json"
+    elif not profile_output.is_absolute():
+        profile_output = PROJECT_ROOT / profile_output
+    try:
+        profile_display_path = profile_output.relative_to(PROJECT_ROOT)
+    except ValueError:
+        profile_display_path = Path(profile_output.name)
+    profiler = StageProfiler(
+        enabled=args.profile,
+        devices=[device, device_eval],
+        output_path=profile_output,
+        enable_nvml=not args.profile_no_nvml,
+        nvml_interval_s=args.profile_nvml_interval_ms / 1000.0,
+    )
+    if args.profile:
+        print(
+            f"[Profile] enabled; json={profile_display_path}; "
+            f"cuda_devices={profiler.cuda_devices}; nvml={profiler.nvml_enabled}; "
+            f"full_param_check={args.profile_full_param_check}",
+            flush=True,
+        )
 
     optimizer = AdamW(policy_model.parameters(), lr=learning_rate, weight_decay=0.0, betas=(0.9, 0.95))
     optimizer.zero_grad()
@@ -730,26 +799,28 @@ def main() -> None:
         f"for N={val_pool_size} sequential validation occurrences",
         flush=True,
     )
-    with _generation_mode(sft_model):
-        flat_reference_outputs = _frozen_generate_batch_fast(
-            prompts=flat_validation_prompts,
-            model=sft_model,
-            tokenizer=tokenizer,
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=min_new_tokens,
-            temperature=eval_temperature,
-            stop_sequences=[stop_sequence],
-            batch_size=batch_gen_size,
-        )
-    if len(flat_reference_outputs) != val_pool_size:
-        raise RuntimeError(
-            "Frozen-reference generation did not return exactly one output "
-            "per scheduled validation occurrence."
-        )
-    flat_reference_correctness = [
-        _is_correct(output, gold)
-        for output, gold in zip(flat_reference_outputs, flat_validation_gold)
-    ]
+    with profiler.phase("reference_precompute"):
+        with _generation_mode(sft_model):
+            flat_reference_outputs = _frozen_generate_batch_fast(
+                prompts=flat_validation_prompts,
+                model=sft_model,
+                tokenizer=tokenizer,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                temperature=eval_temperature,
+                stop_sequences=[stop_sequence],
+                batch_size=batch_gen_size,
+                show_progress=not args.profile,
+            )
+        if len(flat_reference_outputs) != val_pool_size:
+            raise RuntimeError(
+                "Frozen-reference generation did not return exactly one output "
+                "per scheduled validation occurrence."
+            )
+        flat_reference_correctness = [
+            _is_correct(output, gold)
+            for output, gold in zip(flat_reference_outputs, flat_validation_gold)
+        ]
     reference_correctness_by_step = [
         flat_reference_correctness[
             step * val_size : (step + 1) * val_size
@@ -769,6 +840,7 @@ def main() -> None:
     train_offset = 0
 
     for grpo_step in range(n_grpo_steps):
+        profiler.begin_outer_step(grpo_step, optimizer_updates=num_ebs)
         # Get next chunk of training data
         chunk_end = train_offset + n_q_per_rollout_batch
         if chunk_end <= len(train_problems):
@@ -787,54 +859,59 @@ def main() -> None:
 
         # ===== A: GRPO rollouts (mixed generation) =====
         print(f"[AdaptiveWeight Sampling] grpo_step={grpo_step}", flush=True)
-        with _generation_mode(policy_model):
-            rollout_responses = _mixed_generate_batch_fast(
-                prompts=prompt_train_duplicate,
-                policy_model=policy_model,
-                sft_model=sft_model,
-                tokenizer=tokenizer,
-                device=device,
-                alpha=alpha,
-                max_new_tokens=max_new_tokens,
-                min_new_tokens=min_new_tokens,
-                temperature=rollout_temperature,
-                stop_sequences=[stop_sequence],
-                batch_size=batch_gen_size,
+        with profiler.phase("rollout"):
+            with _generation_mode(policy_model):
+                rollout_responses = _mixed_generate_batch_fast(
+                    prompts=prompt_train_duplicate,
+                    policy_model=policy_model,
+                    sft_model=sft_model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    alpha=alpha,
+                    max_new_tokens=max_new_tokens,
+                    min_new_tokens=min_new_tokens,
+                    temperature=rollout_temperature,
+                    stop_sequences=[stop_sequence],
+                    batch_size=batch_gen_size,
+                    show_progress=not args.profile,
+                )
+
+        with profiler.phase("reward"):
+            advantages, raw_rewards, reward_md = run_compute_group_normalized_rewards(
+                reward_fn=r1_zero_reward_fn,
+                rollout_responses=rollout_responses,
+                repeated_ground_truths=answer_train_duplicate_gold,
+                group_size=group_size,
+                advantage_eps=advantage_eps,
+                normalize_by_std=use_std_normalization,
             )
 
-        advantages, raw_rewards, reward_md = run_compute_group_normalized_rewards(
-            reward_fn=r1_zero_reward_fn,
-            rollout_responses=rollout_responses,
-            repeated_ground_truths=answer_train_duplicate_gold,
-            group_size=group_size,
-            advantage_eps=advantage_eps,
-            normalize_by_std=use_std_normalization,
-        )
-
-        data_tokenized = run_tokenize_prompt_and_output(
-            tokenizer=tokenizer,
-            prompt_strs=prompt_train_duplicate,
-            output_strs=rollout_responses,
-        )
+        with profiler.phase("tokenization"):
+            data_tokenized = run_tokenize_prompt_and_output(
+                tokenizer=tokenizer,
+                prompt_strs=prompt_train_duplicate,
+                output_strs=rollout_responses,
+            )
 
         whole_ids = data_tokenized["input_ids"]
         whole_lbl = data_tokenized["labels"]
 
         # old log probs under the mixed behavior policy (theta_old, alpha)
         whole_logp_old_parts: List[torch.Tensor] = []
-        with torch.no_grad():
-            for i in range(0, whole_ids.size(0), logp_chunk_size):
-                ids_chunk = whole_ids[i : i + logp_chunk_size].to(device, non_blocking=True)
-                lbl_chunk = whole_lbl[i : i + logp_chunk_size].to(device, non_blocking=True)
-                chunk_logp = _mixed_log_probs(
-                    policy_model=policy_model,
-                    sft_model=sft_model,
-                    input_ids=ids_chunk,
-                    labels=lbl_chunk,
-                    alpha=alpha,
-                )["log_probs"]
-                whole_logp_old_parts.append(chunk_logp.cpu())
-        whole_logp_old = torch.cat(whole_logp_old_parts, dim=0)
+        with profiler.phase("old_logprob"):
+            with torch.no_grad():
+                for i in range(0, whole_ids.size(0), logp_chunk_size):
+                    ids_chunk = whole_ids[i : i + logp_chunk_size].to(device, non_blocking=True)
+                    lbl_chunk = whole_lbl[i : i + logp_chunk_size].to(device, non_blocking=True)
+                    chunk_logp = _mixed_log_probs(
+                        policy_model=policy_model,
+                        sft_model=sft_model,
+                        input_ids=ids_chunk,
+                        labels=lbl_chunk,
+                        alpha=alpha,
+                    )["log_probs"]
+                    whole_logp_old_parts.append(chunk_logp.cpu())
+            whole_logp_old = torch.cat(whole_logp_old_parts, dim=0)
 
         # iterate effective batches
         global_step_base = grpo_step * num_ebs
@@ -856,24 +933,25 @@ def main() -> None:
                 s = step * microbatch_size
                 e = s + microbatch_size
 
-                eb_ids = ids[s:e].to(device, non_blocking=True)
-                eb_lbl = lbls[s:e].to(device, non_blocking=True)
-                eb_msk = msk[s:e].to(device, non_blocking=True)
-                eb_adv = adv[s:e].to(device, non_blocking=True)
-                eb_logp_old = logp_old[s:e].to(device, non_blocking=True)
+                with profiler.phase("forward"):
+                    eb_ids = ids[s:e].to(device, non_blocking=True)
+                    eb_lbl = lbls[s:e].to(device, non_blocking=True)
+                    eb_msk = msk[s:e].to(device, non_blocking=True)
+                    eb_adv = adv[s:e].to(device, non_blocking=True)
+                    eb_logp_old = logp_old[s:e].to(device, non_blocking=True)
 
-                eb_out = _mixed_log_probs(
-                    policy_model=policy_model,
-                    sft_model=sft_model,
-                    input_ids=eb_ids,
-                    labels=eb_lbl,
-                    alpha=alpha,
-                    return_token_entropy=True,
-                )
-                eb_logp = eb_out["log_probs"]
-                eb_entropy = eb_out["token_entropy"]
-                entropy_sum += (eb_entropy * eb_msk).sum()
-                mask_elements_sum += eb_msk.sum()
+                    eb_out = _mixed_log_probs(
+                        policy_model=policy_model,
+                        sft_model=sft_model,
+                        input_ids=eb_ids,
+                        labels=eb_lbl,
+                        alpha=alpha,
+                        return_token_entropy=True,
+                    )
+                    eb_logp = eb_out["log_probs"]
+                    eb_entropy = eb_out["token_entropy"]
+                    entropy_sum += (eb_entropy * eb_msk).sum()
+                    mask_elements_sum += eb_msk.sum()
 
                 eb_loss, _ = run_grpo_microbatch_train_step(
                     policy_log_probs=eb_logp,
@@ -884,40 +962,56 @@ def main() -> None:
                     old_log_probs=eb_logp_old,
                     cliprange=cliprange,
                     normalization=len_normalization,
+                    profile_phase=(profiler.phase if args.profile else None),
                 )
                 loss_sum += eb_loss.detach().item()
 
-            avg_entropy = entropy_sum / torch.clamp(mask_elements_sum, min=1.0)
-            grad_params = [p for p in policy_model.parameters() if p.grad is not None]
-            sample_param = grad_params[0] if grad_params else None
+            with profiler.phase("grad_metrics"):
+                avg_entropy = entropy_sum / torch.clamp(mask_elements_sum, min=1.0)
+                grad_params = [p for p in policy_model.parameters() if p.grad is not None]
+                sample_param = grad_params[0] if grad_params else None
+                grad_norm = torch.sqrt(
+                    sum(
+                        (p.grad.detach().float().norm(2) ** 2)
+                        for p in policy_model.parameters()
+                        if p.grad is not None
+                    )
+                )
 
-            sample_before = (
-                sample_param.detach().view(-1)[:8].clone().float()
-                if sample_param is not None
-                else None
-            )
-            grad_norm = torch.sqrt(
-                sum(
-                    (p.grad.detach().float().norm(2) ** 2)
-                    for p in policy_model.parameters()
-                    if p.grad is not None
+            with profiler.phase("param_diagnostics"):
+                sample_before = (
+                    sample_param.detach().view(-1)[:8].clone().float()
+                    if sample_param is not None
+                    else None
                 )
-            )
-            # Store param snapshots on CPU in bf16 to avoid GPU OOM
-            grad_param_befores = [p.detach().cpu().clone() for p in grad_params]
-            torch.cuda.empty_cache()
-            optimizer.step()
-            sample_update_max = None
-            full_update_max = None
-            if sample_param is not None and sample_before is not None:
-                sample_after = sample_param.detach().view(-1)[:8].float()
-                sample_update_max = (sample_after - sample_before.to(sample_after.device)).abs().max().item()
-            if grad_params:
-                full_update_max = max(
-                    (p.detach().cpu().float() - before.float()).abs().max().item()
-                    for p, before in zip(grad_params, grad_param_befores)
+                keep_full_param_check = (
+                    not args.profile or args.profile_full_param_check
                 )
-            optimizer.zero_grad()
+                # This full GPU-to-CPU clone is a debug check, not optimizer work.
+                grad_param_befores = (
+                    [p.detach().cpu().clone() for p in grad_params]
+                    if keep_full_param_check
+                    else None
+                )
+            with profiler.phase("allocator_cleanup"):
+                torch.cuda.empty_cache()
+            with profiler.phase("optimizer"):
+                optimizer.step()
+            with profiler.phase("param_diagnostics"):
+                sample_update_max = None
+                full_update_max = None
+                if sample_param is not None and sample_before is not None:
+                    sample_after = sample_param.detach().view(-1)[:8].float()
+                    sample_update_max = (
+                        sample_after - sample_before.to(sample_after.device)
+                    ).abs().max().item()
+                if grad_param_befores:
+                    full_update_max = max(
+                        (p.detach().cpu().float() - before.float()).abs().max().item()
+                        for p, before in zip(grad_params, grad_param_befores)
+                    )
+            with profiler.phase("zero_grad"):
+                optimizer.zero_grad()
 
             global_step = global_step_base + eb
             print(
@@ -946,49 +1040,53 @@ def main() -> None:
                     f"[AdaptiveWeight Evaluation] starting eval at step={global_step} ",
                     flush=True,
                 )
-                # ===== B: Eval mixed (500) =====
-                with _generation_mode(policy_model):
-                    eval_outputs = _mixed_generate_batch_fast(
+                with profiler.phase("evaluation"):
+                    # ===== B: Eval mixed (500) =====
+                    with _generation_mode(policy_model):
+                        eval_outputs = _mixed_generate_batch_fast(
+                            prompts=eval_prompts,
+                            policy_model=policy_model,
+                            sft_model=sft_model,
+                            tokenizer=tokenizer,
+                            device=device,
+                            alpha=alpha,
+                            max_new_tokens=max_new_tokens,
+                            min_new_tokens=min_new_tokens,
+                            temperature=eval_temperature,
+                            stop_sequences=[stop_sequence],
+                            batch_size=batch_gen_size,
+                            show_progress=not args.profile,
+                        )
+
+                    # ===== C: Eval pi_theta (500) via vLLM =====
+                    _load_policy_into_vllm_fresh(policy_model, llm)
+                    eval_pi_theta_outputs = _vllm_policy_generate(
+                        llm=llm,
                         prompts=eval_prompts,
-                        policy_model=policy_model,
-                        sft_model=sft_model,
-                        tokenizer=tokenizer,
-                        device=device,
-                        alpha=alpha,
+                        temperature=eval_temperature,
                         max_new_tokens=max_new_tokens,
                         min_new_tokens=min_new_tokens,
-                        temperature=eval_temperature,
                         stop_sequences=[stop_sequence],
-                        batch_size=batch_gen_size,
+                        show_progress=not args.profile,
                     )
 
-                # ===== C: Eval pi_theta (500) via vLLM =====
-                _load_policy_into_vllm_fresh(policy_model, llm)
-                eval_pi_theta_outputs = _vllm_policy_generate(
-                    llm=llm,
-                    prompts=eval_prompts,
-                    temperature=eval_temperature,
-                    max_new_tokens=max_new_tokens,
-                    min_new_tokens=min_new_tokens,
-                    stop_sequences=[stop_sequence],
-                )
-
-                eval_correct = sum(_is_correct(y, g) for y, g in zip(eval_outputs, eval_gold))
-                eval_accuracy = eval_correct / max(1, len(eval_gold))
-                eval_pi_theta_correct = sum(
-                    _is_correct(y, g) for y, g in zip(eval_pi_theta_outputs, eval_gold)
-                )
-                eval_pi_theta = eval_pi_theta_correct / max(1, len(eval_gold))
-                log_entry["eval/accuracy"] = eval_accuracy
-                log_entry["eval_pi_theta"] = eval_pi_theta
+                    eval_correct = sum(_is_correct(y, g) for y, g in zip(eval_outputs, eval_gold))
+                    eval_accuracy = eval_correct / max(1, len(eval_gold))
+                    eval_pi_theta_correct = sum(
+                        _is_correct(y, g) for y, g in zip(eval_pi_theta_outputs, eval_gold)
+                    )
+                    eval_pi_theta = eval_pi_theta_correct / max(1, len(eval_gold))
+                    log_entry["eval/accuracy"] = eval_accuracy
+                    log_entry["eval_pi_theta"] = eval_pi_theta
 
             # Start to log to wandb
-            print(f"[AdaptiveWeight Wandb] wandb log data: {log_entry}", flush=True)
-            wandb.log(
-                log_entry,
-                step=global_step,
-                commit=eb != num_ebs - 1,
-            )
+            with profiler.phase("logging"):
+                print(f"[AdaptiveWeight Wandb] wandb log data: {log_entry}", flush=True)
+                wandb.log(
+                    log_entry,
+                    step=global_step,
+                    commit=eb != num_ebs - 1,
+                )
 
         # Update alpha using the next sequential validation batch. The current
         # theta, current mixed policy, and cached frozen SFT are compared on
@@ -999,98 +1097,147 @@ def main() -> None:
             flush=True,
         )
 
-        val_indices = _cyclic_indices(
-            start=train_offset,
-            count=val_size,
-            total=len(train_problems),
-        )
-        expected_indices = validation_indices_by_step[grpo_step]
-        if val_indices != expected_indices:
-            raise RuntimeError(
-                "Sequential validation schedule diverged from the cached "
-                f"reference schedule at grpo_step={grpo_step}."
+        with profiler.phase("controller_validation"):
+            val_indices = _cyclic_indices(
+                start=train_offset,
+                count=val_size,
+                total=len(train_problems),
             )
-        val_q = [train_problems[index] for index in val_indices]
-        val_gold_list = [train_gold[index] for index in val_indices]
-        c_ref = reference_correctness_by_step[grpo_step]
-        train_offset = (train_offset + val_size) % len(train_problems)
+            expected_indices = validation_indices_by_step[grpo_step]
+            if val_indices != expected_indices:
+                raise RuntimeError(
+                    "Sequential validation schedule diverged from the cached "
+                    f"reference schedule at grpo_step={grpo_step}."
+                )
+            val_q = [train_problems[index] for index in val_indices]
+            val_gold_list = [train_gold[index] for index in val_indices]
+            c_ref = reference_correctness_by_step[grpo_step]
+            train_offset = (train_offset + val_size) % len(train_problems)
 
-        val_prompts = r1_prompts_from_train(val_q)
+            val_prompts = r1_prompts_from_train(val_q)
 
-        # ===== D: Alpha y_theta (100) via vLLM =====
-        _load_policy_into_vllm_fresh(policy_model, llm)
-        y_theta = _vllm_policy_generate(
-            llm=llm,
-            prompts=val_prompts,
-            temperature=eval_temperature,
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=min_new_tokens,
-            stop_sequences=[stop_sequence],
-        )
-
-        # ===== E: Alpha y_mix (100) via batched mixed gen =====
-        with _generation_mode(policy_model):
-            y_mix = _mixed_generate_batch_fast(
+            # ===== D: Alpha y_theta (100) via vLLM =====
+            _load_policy_into_vllm_fresh(policy_model, llm)
+            y_theta = _vllm_policy_generate(
+                llm=llm,
                 prompts=val_prompts,
-                policy_model=policy_model,
-                sft_model=sft_model,
-                tokenizer=tokenizer,
-                device=device,
-                alpha=alpha,
+                temperature=eval_temperature,
                 max_new_tokens=max_new_tokens,
                 min_new_tokens=min_new_tokens,
-                temperature=eval_temperature,
                 stop_sequences=[stop_sequence],
-                batch_size=batch_gen_size,
+                show_progress=not args.profile,
             )
 
-        c_theta = [_is_correct(y, g) for y, g in zip(y_theta, val_gold_list)]
-        c_mix = [_is_correct(y, g) for y, g in zip(y_mix, val_gold_list)]
-        if not (len(c_theta) == len(c_mix) == len(c_ref) == val_size):
-            raise RuntimeError("All three policies must be scored on the same validation batch.")
+            # ===== E: Alpha y_mix (100) via batched mixed gen =====
+            with _generation_mode(policy_model):
+                y_mix = _mixed_generate_batch_fast(
+                    prompts=val_prompts,
+                    policy_model=policy_model,
+                    sft_model=sft_model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    alpha=alpha,
+                    max_new_tokens=max_new_tokens,
+                    min_new_tokens=min_new_tokens,
+                    temperature=eval_temperature,
+                    stop_sequences=[stop_sequence],
+                    batch_size=batch_gen_size,
+                    show_progress=not args.profile,
+                )
 
-        q_theta = sum(c_theta) / val_size
-        q_mix = sum(c_mix) / val_size
-        q_ref = sum(c_ref) / val_size
-        alpha_old = alpha
-        controller = _validation_weighted_alpha_update(
-            alpha=alpha_old,
-            q_theta=q_theta,
-            q_mix=q_mix,
-            q_ref=q_ref,
-            temperature=val_controller_temperature,
-            update_rate=alpha_update_rate,
-            alpha_min=alpha_min,
-            alpha_max=alpha_max,
-        )
-        alpha = controller["alpha_new"]
+            c_theta = [_is_correct(y, g) for y, g in zip(y_theta, val_gold_list)]
+            c_mix = [_is_correct(y, g) for y, g in zip(y_mix, val_gold_list)]
+            if not (len(c_theta) == len(c_mix) == len(c_ref) == val_size):
+                raise RuntimeError("All three policies must be scored on the same validation batch.")
+
+            q_theta = sum(c_theta) / val_size
+            q_mix = sum(c_mix) / val_size
+            q_ref = sum(c_ref) / val_size
+
+        with profiler.phase("controller_update"):
+            alpha_old = alpha
+            controller = _validation_weighted_alpha_update(
+                alpha=alpha_old,
+                q_theta=q_theta,
+                q_mix=q_mix,
+                q_ref=q_ref,
+                temperature=val_controller_temperature,
+                update_rate=alpha_update_rate,
+                alpha_min=alpha_min,
+                alpha_max=alpha_max,
+            )
+            alpha = controller["alpha_new"]
+        controller_log = {
+            "alpha/target": controller["alpha_target"],
+            "alpha/new": alpha,
+            "alpha/q_theta": q_theta,
+            "alpha/q_mix": q_mix,
+            "alpha/q_ref": q_ref,
+            "alpha/w_theta": controller["w_theta"],
+            "alpha/w_mix": controller["w_mix"],
+            "alpha/w_ref": controller["w_ref"],
+        }
+        with profiler.phase("logging"):
+            print(
+                f"[ValWeightedAdaptive updating alpha] grpo_step={grpo_step} "
+                f"q_theta={q_theta:.4f} q_mix={q_mix:.4f} q_ref={q_ref:.4f} "
+                f"w_theta={controller['w_theta']:.4f} "
+                f"w_mix={controller['w_mix']:.4f} "
+                f"w_ref={controller['w_ref']:.4f} "
+                f"alpha_old={alpha_old:.4f} "
+                f"alpha_target={controller['alpha_target']:.4f} "
+                f"alpha_new={alpha:.4f}",
+                flush=True,
+            )
+            wandb.log(
+                controller_log,
+                step=global_step_base + num_ebs - 1,
+                commit=not args.profile,
+            )
+
+        profiler.end_outer_step()
+        if args.profile:
+            wandb.log(
+                profiler.last_outer_scalars(),
+                step=global_step_base + num_ebs - 1,
+                commit=True,
+            )
+
+    if args.profile and wandb.run is not None:
+        try:
+            wandb.run.summary.update(profiler.summary_scalars())
+        except Exception as exc:
+            print(
+                f"[Profile] W&B summary update failed ({type(exc).__name__}); "
+                "continuing to final save.",
+                file=sys.stderr,
+                flush=True,
+            )
+    try:
+        profile_path = profiler.close()
+    except Exception as exc:
         print(
-            f"[ValWeightedAdaptive updating alpha] grpo_step={grpo_step} "
-            f"q_theta={q_theta:.4f} q_mix={q_mix:.4f} q_ref={q_ref:.4f} "
-            f"w_theta={controller['w_theta']:.4f} "
-            f"w_mix={controller['w_mix']:.4f} "
-            f"w_ref={controller['w_ref']:.4f} "
-            f"alpha_old={alpha_old:.4f} "
-            f"alpha_target={controller['alpha_target']:.4f} "
-            f"alpha_new={alpha:.4f}",
+            f"[Profile] JSON finalization failed ({type(exc).__name__}); "
+            "continuing to final save.",
+            file=sys.stderr,
             flush=True,
         )
-        wandb.log(
-            {
-                "alpha/target": controller["alpha_target"],
-                "alpha/new": alpha,
-                "alpha/q_theta": q_theta,
-                "alpha/q_mix": q_mix,
-                "alpha/q_ref": q_ref,
-                "alpha/w_theta": controller["w_theta"],
-                "alpha/w_mix": controller["w_mix"],
-                "alpha/w_ref": controller["w_ref"],
-            },
-            step=global_step_base + num_ebs - 1,
-            commit=True,
+    else:
+        if profile_path is not None:
+            print(f"[Profile] wrote {profile_display_path}", flush=True)
+
+    # Finish experiment tracking before the final Hugging Face save.
+    try:
+        wandb.finish()
+    except Exception as exc:
+        print(
+            f"[W&B] finish failed ({type(exc).__name__}); "
+            "continuing to final Hugging Face save.",
+            file=sys.stderr,
+            flush=True,
         )
 
-    # Push only the final trained policy to Hugging Face.
+    # Push only the final trained policy to Hugging Face as the last save.
     policy_model.config.lapo_alpha = float(alpha)
     policy_model.config.lapo_reference_model = sft_model_id
     policy_model.config.lapo_controller = "validation_performance_weighted"
@@ -1099,8 +1246,6 @@ def main() -> None:
     tokenizer.push_to_hub(repo_id, token=token)
     print(f"Model pushed to HF: {repo_id}")
     print(f"Final deployed mixed-policy alpha: {alpha:.6f}")
-
-    wandb.finish()
 
 
 if __name__ == "__main__":

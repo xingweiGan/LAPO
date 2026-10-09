@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import os
 import argparse
+import math
 from contextlib import contextmanager
 from transformers import PreTrainedModel
 from typing import Literal, List, Callable, Dict, Sequence
@@ -26,6 +27,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.optim import AdamW
 from math3b_support.drgrpo_grader import r1_zero_reward_fn, extract_boxed_answer
 from math3b_support.math_baseline import r1_prompts_from_train
+from math3b_support.profiling import StageProfiler
 from datasets import load_dataset
 
 def extract_math_gold(solution: str) -> str:
@@ -76,6 +78,7 @@ def _hf_generate_batch(
     temperature: float = 1.0,
     stop_sequences: Sequence[str] = ("</answer>",),
     batch_size: int = 8,
+    show_progress: bool = True,
 ) -> List[str]:
     """Generate using HF with KV cache, batched. Supports both sampling and greedy."""
     all_outputs: List[str] = []
@@ -148,7 +151,9 @@ def _hf_generate_batch(
                     break
             all_outputs.append(decoded)
 
-        if (batch_start + B) % 256 == 0 or batch_start + B == len(prompts):
+        if show_progress and (
+            (batch_start + B) % 256 == 0 or batch_start + B == len(prompts)
+        ):
             print(f"  [HF Gen] {batch_start + B}/{len(prompts)}", flush=True)
 
     return all_outputs
@@ -164,6 +169,7 @@ def evaluate_hf(
     max_new_tokens: int = 512,
     min_new_tokens: int = 4,
     batch_size: int = 8,
+    show_progress: bool = True,
 ) -> List[float]:
     """Evaluate using HF generation (greedy). Returns [format_rate, accuracy]."""
     outputs = _hf_generate_batch(
@@ -176,6 +182,7 @@ def evaluate_hf(
         temperature=0.0,  # greedy
         stop_sequences=["</answer>"],
         batch_size=batch_size,
+        show_progress=show_progress,
     )
 
     bins = {"11": 0, "10": 0, "01": 0, "00": 0}
@@ -223,7 +230,38 @@ def main() -> None:
     ########################################################
     parser = argparse.ArgumentParser(description="GRPO training with KL regularization.")
     parser.add_argument("--wandb_api_key", default=os.environ.get("WANDB_API_KEY"))
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Record synchronized phase timings and per-GPU memory statistics.",
+    )
+    parser.add_argument(
+        "--profile-output",
+        type=Path,
+        default=None,
+        help="Profiling JSON path (default: profiles/<run_name>.json).",
+    )
+    parser.add_argument(
+        "--profile-no-nvml",
+        action="store_true",
+        help="Disable optional NVML physical-memory sampling.",
+    )
+    parser.add_argument(
+        "--profile-nvml-interval-ms",
+        type=float,
+        default=50.0,
+        help="NVML sampling interval in milliseconds (minimum: 10).",
+    )
     args = parser.parse_args()
+    if (
+        args.profile
+        and not args.profile_no_nvml
+        and (
+            not math.isfinite(args.profile_nvml_interval_ms)
+            or args.profile_nvml_interval_ms < 10.0
+        )
+    ):
+        parser.error("--profile-nvml-interval-ms must be finite and at least 10")
     if args.wandb_api_key:
         wandb.login(key=args.wandb_api_key)
 
@@ -321,6 +359,28 @@ def main() -> None:
         dir=str(PROJECT_ROOT),
         name=run_name,
     )
+    profile_output = args.profile_output
+    if profile_output is None:
+        profile_output = PROJECT_ROOT / "profiles" / f"{run_name}.json"
+    elif not profile_output.is_absolute():
+        profile_output = PROJECT_ROOT / profile_output
+    try:
+        profile_display_path = profile_output.relative_to(PROJECT_ROOT)
+    except ValueError:
+        profile_display_path = Path(profile_output.name)
+    profiler = StageProfiler(
+        enabled=args.profile,
+        devices=[device_train, device_eval],
+        output_path=profile_output,
+        enable_nvml=not args.profile_no_nvml,
+        nvml_interval_s=args.profile_nvml_interval_ms / 1000.0,
+    )
+    if args.profile:
+        print(
+            f"[Profile] enabled; json={profile_display_path}; "
+            f"cuda_devices={profiler.cuda_devices}; nvml={profiler.nvml_enabled}",
+            flush=True,
+        )
     ############################################################
 
 
@@ -347,6 +407,7 @@ def main() -> None:
     train_offset = 0
     #First, sampling
     for grpo_step in range(n_grpo_steps):
+        profiler.begin_outer_step(grpo_step, optimizer_updates=num_ebs)
         # Get next chunk of training data
         chunk_end = train_offset + n_q_per_rollout_batch
         if chunk_end <= len(train_problems):
@@ -366,48 +427,53 @@ def main() -> None:
 
         #Get response using HF generation (with temperature sampling)
         print(f"[GRPO Step {grpo_step}] Generating rollouts via HF...", flush=True)
-        with _generation_mode(model):
-            response_train_duplicate = _hf_generate_batch(
-                prompts=prompt_train_duplicate,
-                model=model,
-                tokenizer=tokenizer,
-                device=torch.device(device_train),
-                max_new_tokens=sampling_max_tokens,
-                min_new_tokens=sampling_min_tokens,
-                temperature=sampling_temperature,
-                stop_sequences=["</answer>"],
-                batch_size=batch_gen_size,
+        with profiler.phase("rollout"):
+            with _generation_mode(model):
+                response_train_duplicate = _hf_generate_batch(
+                    prompts=prompt_train_duplicate,
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=torch.device(device_train),
+                    max_new_tokens=sampling_max_tokens,
+                    min_new_tokens=sampling_min_tokens,
+                    temperature=sampling_temperature,
+                    stop_sequences=["</answer>"],
+                    batch_size=batch_gen_size,
+                    show_progress=not args.profile,
+                )
+
+        with profiler.phase("reward"):
+            advantages_train,_,_ = run_compute_group_normalized_rewards(
+                reward_fn=r1_zero_reward_fn,
+                rollout_responses=response_train_duplicate,
+                repeated_ground_truths=answer_train_duplicate_gold,
+                group_size=group_size,
+                advantage_eps=advantage_eps,
+                normalize_by_std=True,
             )
 
-        advantages_train,_,_ = run_compute_group_normalized_rewards(
-        reward_fn=r1_zero_reward_fn ,
-        rollout_responses= response_train_duplicate ,
-        repeated_ground_truths = answer_train_duplicate_gold,
-        group_size = group_size,
-        advantage_eps = advantage_eps,
-        normalize_by_std = True,
-        )
-
-
-        data_tokenized = run_tokenize_prompt_and_output(
-        tokenizer=tokenizer,
-        prompt_strs=prompt_train_duplicate,
-        output_strs=response_train_duplicate  # Use generated responses, not ground truth!
-        )
+        with profiler.phase("tokenization"):
+            data_tokenized = run_tokenize_prompt_and_output(
+                tokenizer=tokenizer,
+                prompt_strs=prompt_train_duplicate,
+                output_strs=response_train_duplicate,
+            )
 
         #NEW!: Get log_prob from old policy
         whole_ids = data_tokenized["input_ids"]
         whole_lbl = data_tokenized["labels"]
         chunk_size = 2
         whole_logp_old_parts = []
-        with torch.no_grad():
-            for i in range(0, whole_ids.size(0), chunk_size):
-                ids_chunk = whole_ids[i:i+chunk_size].to(device_train, non_blocking=True)
-                lbl_chunk = whole_lbl[i:i+chunk_size].to(device_train, non_blocking=True)
-                chunk_logp = run_get_response_log_probs(model, ids_chunk, lbl_chunk)["log_probs"]
-                whole_logp_old_parts.append(chunk_logp.cpu())
-                print(i)
-        whole_logp_old = torch.cat(whole_logp_old_parts, dim=0)
+        with profiler.phase("old_logprob"):
+            with torch.no_grad():
+                for i in range(0, whole_ids.size(0), chunk_size):
+                    ids_chunk = whole_ids[i:i+chunk_size].to(device_train, non_blocking=True)
+                    lbl_chunk = whole_lbl[i:i+chunk_size].to(device_train, non_blocking=True)
+                    chunk_logp = run_get_response_log_probs(model, ids_chunk, lbl_chunk)["log_probs"]
+                    whole_logp_old_parts.append(chunk_logp.cpu())
+                    if not args.profile:
+                        print(i)
+            whole_logp_old = torch.cat(whole_logp_old_parts, dim=0)
 
 
 
@@ -424,7 +490,8 @@ def main() -> None:
             logp_old = whole_logp_old [base:end]
 
 
-            print(f"gradient_accumulation_steps: {gradient_accumulation_steps}")
+            if not args.profile:
+                print(f"gradient_accumulation_steps: {gradient_accumulation_steps}")
             entropy_sum =0
             mask_elements_sum = 0
             loss_sum = 0
@@ -435,23 +502,30 @@ def main() -> None:
                 s = step * microbatch_size
                 e = s + microbatch_size
 
-                eb_ids = ids[s:e].to(device_train, non_blocking=True)
-                eb_lbl = lbls[s:e].to(device_train, non_blocking=True)
-                eb_msk = msk[s:e].to(device_train, non_blocking=True)
-                eb_advantages= advantages[s:e].to(device_train, non_blocking=True)
-                eb_out = run_get_response_log_probs(model, eb_ids, eb_lbl, return_token_entropy=True)
-                eb_logp = eb_out["log_probs"]
-                eb_logp_old= logp_old[s:e].to(device_train, non_blocking=True)
-                with torch.no_grad():
-                    eb_ref_logp = run_get_response_log_probs(ref_model, eb_ids.to(device_eval), eb_lbl.to(device_eval))["log_probs"]
-                    eb_ref_logp = eb_ref_logp.to(device_train)
-                print(f"Step {step}: advantages shape={eb_advantages.shape}, mean={eb_advantages.mean():.4f}, std={eb_advantages.std():.4f}")
-
-                #NEW HERE!!!! prepare to edit!!!!!!!!!!!!!!
-                with torch.no_grad():
-                    eb_entropy = eb_out["token_entropy"]
-                    entropy_sum += (eb_entropy * eb_msk).sum()
-                    mask_elements_sum += eb_msk.sum()
+                with profiler.phase("forward"):
+                    eb_ids = ids[s:e].to(device_train, non_blocking=True)
+                    eb_lbl = lbls[s:e].to(device_train, non_blocking=True)
+                    eb_msk = msk[s:e].to(device_train, non_blocking=True)
+                    eb_advantages= advantages[s:e].to(device_train, non_blocking=True)
+                    eb_out = run_get_response_log_probs(model, eb_ids, eb_lbl, return_token_entropy=True)
+                    eb_logp = eb_out["log_probs"]
+                    eb_logp_old= logp_old[s:e].to(device_train, non_blocking=True)
+                    with torch.no_grad():
+                        eb_ref_logp = run_get_response_log_probs(
+                            ref_model,
+                            eb_ids.to(device_eval),
+                            eb_lbl.to(device_eval),
+                        )["log_probs"]
+                        eb_ref_logp = eb_ref_logp.to(device_train)
+                    with torch.no_grad():
+                        eb_entropy = eb_out["token_entropy"]
+                        entropy_sum += (eb_entropy * eb_msk).sum()
+                        mask_elements_sum += eb_msk.sum()
+                if not args.profile:
+                    print(
+                        f"Step {step}: advantages shape={eb_advantages.shape}, "
+                        f"mean={eb_advantages.mean():.4f}, std={eb_advantages.std():.4f}"
+                    )
 
             # scale manually for accumulation;
                 eb_loss, _=run_grpo_microbatch_train_step(policy_log_probs=eb_logp,
@@ -463,20 +537,26 @@ def main() -> None:
                                                ref_log_probs=eb_ref_logp,
                                                cliprange=0.2,
                                                normalization=len_normalization,
-                                               beta=beta
+                                               beta=beta,
+                                               profile_phase=(
+                                                   profiler.phase if args.profile else None
+                                               ),
                                                )
                 loss_sum += eb_loss.detach().item()
 
 
             #!!!!!!!!!!!!!!!!Start to edit here!!!#!!!!!!!!!!!!!!!!#!!!!!!!!!!!!!!!!#!!!!!!!!!!!!!!!!
             #START TO LOG!!
-            avg_entropy=entropy_sum/mask_elements_sum
-            grad_norm = torch.sqrt(sum(
-                (p.grad.detach().float().norm(2)**2)
-                for p in model.parameters() if p.grad is not None
-            ))
-            torch.cuda.empty_cache()
-            optimizer.step() #we update the policy here!!
+            with profiler.phase("grad_metrics"):
+                avg_entropy=entropy_sum/mask_elements_sum
+                grad_norm = torch.sqrt(sum(
+                    (p.grad.detach().float().norm(2)**2)
+                    for p in model.parameters() if p.grad is not None
+                ))
+            with profiler.phase("allocator_cleanup"):
+                torch.cuda.empty_cache()
+            with profiler.phase("optimizer"):
+                optimizer.step() #we update the policy here!!
             # Calculate global step
             global_step = grpo_step * num_ebs + eb
 
@@ -484,18 +564,20 @@ def main() -> None:
             accuracy = None
             if (global_step + 1) % eval_every_effective_batches == 0:
                 print(f"[Eval] Starting eval at step={global_step} via HF...", flush=True)
-                with _generation_mode(model):
-                    _, accuracy = evaluate_hf(
-                        model=model,
-                        tokenizer=tokenizer,
-                        device=torch.device(device_train),
-                        reward_fn=r1_zero_reward_fn,
-                        prompts=prompts_eval,
-                        ground_truths=ground_truth_eval,
-                        max_new_tokens=sampling_max_tokens,
-                        min_new_tokens=sampling_min_tokens,
-                        batch_size=batch_gen_size,
-                    )
+                with profiler.phase("evaluation"):
+                    with _generation_mode(model):
+                        _, accuracy = evaluate_hf(
+                            model=model,
+                            tokenizer=tokenizer,
+                            device=torch.device(device_train),
+                            reward_fn=r1_zero_reward_fn,
+                            prompts=prompts_eval,
+                            ground_truths=ground_truth_eval,
+                            max_new_tokens=sampling_max_tokens,
+                            min_new_tokens=sampling_min_tokens,
+                            batch_size=batch_gen_size,
+                            show_progress=not args.profile,
+                        )
 
             loss=eb_loss #This is on the trainning set
 
@@ -511,15 +593,62 @@ def main() -> None:
             }
             if accuracy is not None:
                 log_entry["eval/accuracy"] = accuracy
-            print("WANDAB LOG!")
-            print(grpo_step)
-            print(global_step)
+            with profiler.phase("logging"):
+                print("WANDB LOG!")
+                print(grpo_step)
+                print(global_step)
+                wandb.log(
+                    log_entry,
+                    step=global_step,
+                    commit=not (args.profile and eb == num_ebs - 1),
+                )
+                all_logs.append(log_entry)
+            with profiler.phase("zero_grad"):
+                optimizer.zero_grad()
 
-            wandb.log(log_entry, step=global_step)
-            all_logs.append(log_entry)
-            optimizer.zero_grad()
+        profiler.end_outer_step()
+        if args.profile:
+            wandb.log(
+                profiler.last_outer_scalars(),
+                step=grpo_step * num_ebs + num_ebs - 1,
+                commit=True,
+            )
 
-    # Push trained policy to HuggingFace
+    if args.profile and wandb.run is not None:
+        try:
+            wandb.run.summary.update(profiler.summary_scalars())
+        except Exception as exc:
+            print(
+                f"[Profile] W&B summary update failed ({type(exc).__name__}); "
+                "continuing to final save.",
+                file=sys.stderr,
+                flush=True,
+            )
+    try:
+        profile_path = profiler.close()
+    except Exception as exc:
+        print(
+            f"[Profile] JSON finalization failed ({type(exc).__name__}); "
+            "continuing to final save.",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        if profile_path is not None:
+            print(f"[Profile] wrote {profile_display_path}", flush=True)
+
+    # Finish experiment tracking before the final Hugging Face save.
+    try:
+        wandb.finish()
+    except Exception as exc:
+        print(
+            f"[W&B] finish failed ({type(exc).__name__}); "
+            "continuing to final Hugging Face save.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    # Push trained policy to HuggingFace as the final external save.
     if not SMOKE:
         repo_id = f"{hf_username}/{run_name}"
         token = os.environ["HF_TOKEN"]
@@ -528,8 +657,6 @@ def main() -> None:
         print(f"Model pushed to HF: {repo_id}")
     else:
         print("[SMOKE] Skipping push_to_hub", flush=True)
-
-    wandb.finish()
 
 
 if __name__ == "__main__":

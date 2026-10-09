@@ -61,6 +61,38 @@ python Train_MATH_3B_Adaptive_ValWeighted.py
 
 Choose one command to start the corresponding training run.
 
+## Optional runtime and GPU-memory profiling
+
+Profiling is off by default. Add `--profile` to either the GRPO+KL script or
+the validation-weighted Adaptive script:
+
+```bash
+python Train_MATH_3B_GRPO_KL.py --profile
+python Train_MATH_3B_Adaptive_ValWeighted.py --profile
+```
+
+Each run writes a local JSON summary under `profiles/` and adds aggregate
+`profile/...` scalars plus whole-run `profile_summary/...` statistics to the
+existing W&B run. It records synchronized phase time, per-visible-GPU PyTorch
+allocated/reserved peaks, optional NVML physical/process-tree memory peaks, and
+static NVTX ranges. Prompts, responses, gold answers, token IDs, environment
+variables, credentials, and raw traces are never written by the profiler.
+
+Useful options:
+
+```bash
+--profile-output profiles/custom.json
+--profile-no-nvml
+--profile-nvml-interval-ms 50
+--profile-full-param-check  # Adaptive only; includes the costly full CPU copy/diff
+```
+
+No desktop profiling app is required for the JSON and W&B measurements. The
+phase profiler deliberately inserts CUDA synchronization at phase boundaries,
+so use these runs for the time breakdown; use a normal run without `--profile`
+as the uninstrumented end-to-end runtime baseline. NVTX ranges are available if
+you later choose to inspect a separate run with Nsight Systems.
+
 ## “简略图”的制作流程与指导
 
 以后用户要求“简略图”时，按照下面的方法从当前代码整理，不直接复用可能已经过期的旧图。
