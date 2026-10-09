@@ -23,6 +23,39 @@ On Runpod, provide these same three names through the template environment varia
 
 Your Hugging Face token must allow access to the required models and uploading training results. The first run requires internet access to download models and the dataset.
 
+## Prebuilt RunPod image
+
+The dependency-only image is published by GitHub Actions to:
+
+```text
+ghcr.io/xingweigan/lapo:cu124-py312
+```
+
+Use that value as the container image in the RunPod template. Keep
+`HF_TOKEN`, `WANDB_API_KEY`, and `HF_USERNAME` in the RunPod template
+environment variables/secrets; they are not stored in the image.
+
+The first GHCR publication may create a private package. Before using the
+image in RunPod, either change the package visibility to Public in GitHub or
+configure the RunPod container registry credentials with read-only package
+access.
+
+The image already contains Python 3.12, PyTorch/CUDA, vLLM, flash-attn, and all
+dependencies locked by `uv.lock`. On a new Pod, only fetch the current source:
+
+```bash
+cd /workspace
+git clone https://github.com/xingweiGan/LAPO.git
+cd LAPO
+python check_environment.py
+```
+
+Then run the selected training script directly. Do not run `uv sync`,
+`pip install vllm`, or activate a project `.venv` when using this image. The
+image places its environment on `PATH`, and Hugging Face downloads are cached
+under `/workspace/.cache/huggingface` so a persistent RunPod volume can reuse
+them.
+
 ## 2. Run one training script
 
 All five scripts use the Qwen2.5-3B model family and the `Maxwell-Jia/MATH` dataset. The four post-SFT scripts use the fixed SFT checkpoint `xw1234gan/SFT_Qwen2.5-3B-Instruct_MATH`; no additional SFT checkpoint environment variable is required. Each script runs independently.

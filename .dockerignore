@@ -1,0 +1,8 @@
+# Dependency-only image: deny everything, then allow only build inputs.
+*
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!uv.lock
+!.python-version
+!README.md
