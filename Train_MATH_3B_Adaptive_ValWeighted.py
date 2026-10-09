@@ -13,6 +13,7 @@ import math
 import os
 import random
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Sequence
@@ -47,6 +48,16 @@ from math3b_support.SFT_policy import (  # noqa: E402
     load_policy_into_vllm_instance,
     extract_math_gold,
 )
+
+
+_RUN_STARTED_AT = time.perf_counter()
+_HEARTBEAT_INTERVAL_SECONDS = 60.0
+
+
+def _progress(message: str) -> None:
+    """Print a timestamped heartbeat that is visible in Runpod logs."""
+    elapsed = time.perf_counter() - _RUN_STARTED_AT
+    print(f"[Progress +{elapsed:8.1f}s] {message}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +239,7 @@ def _mixed_generate_batch_fast(
 
     all_outputs: List[str] = []
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    last_heartbeat_at = time.perf_counter()
 
     for batch_start in range(0, len(prompts), batch_size):
         batch_prompts = prompts[batch_start : batch_start + batch_size]
@@ -330,6 +342,18 @@ def _mixed_generate_batch_fast(
                 f"{batch_start + B}/{len(prompts)}",
                 flush=True,
             )
+        else:
+            now = time.perf_counter()
+            completed = batch_start + B
+            if (
+                batch_start == 0
+                or completed == len(prompts)
+                or now - last_heartbeat_at >= _HEARTBEAT_INTERVAL_SECONDS
+            ):
+                _progress(
+                    f"mixed generation is running: {completed}/{len(prompts)} prompts complete"
+                )
+                last_heartbeat_at = now
 
     return all_outputs
 
@@ -350,6 +374,7 @@ def _frozen_generate_batch_fast(
     all_outputs: List[str] = []
     model_device = next(model.parameters()).device
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    last_heartbeat_at = time.perf_counter()
 
     for batch_start in range(0, len(prompts), batch_size):
         batch_prompts = prompts[batch_start : batch_start + batch_size]
@@ -450,6 +475,19 @@ def _frozen_generate_batch_fast(
                 f"{batch_start + batch_len}/{len(prompts)}",
                 flush=True,
             )
+        else:
+            now = time.perf_counter()
+            completed = batch_start + batch_len
+            if (
+                batch_start == 0
+                or completed == len(prompts)
+                or now - last_heartbeat_at >= _HEARTBEAT_INTERVAL_SECONDS
+            ):
+                _progress(
+                    "frozen-reference generation is running: "
+                    f"{completed}/{len(prompts)} prompts complete"
+                )
+                last_heartbeat_at = now
 
     return all_outputs
 
@@ -476,7 +514,11 @@ def _vllm_policy_generate(
         stop=list(stop_sequences),
         include_stop_str_in_output=True,
     )
+    if not show_progress:
+        _progress(f"vLLM generation started: {len(prompts)} prompts")
     raw_outputs = llm.generate(prompts, params, use_tqdm=show_progress)
+    if not show_progress:
+        _progress(f"vLLM generation finished: {len(raw_outputs)}/{len(prompts)} prompts")
     results: List[str] = []
     for out in raw_outputs:
         text = out.outputs[0].text if out.outputs else ""
@@ -489,6 +531,7 @@ def _load_policy_into_vllm_fresh(
     llm: LLM,
 ) -> None:
     """Load current policy weights and invalidate KV cache from older weights."""
+    _progress("syncing current policy weights into vLLM")
     load_policy_into_vllm_instance(policy_model, llm)
     reset_prefix_cache = getattr(llm, "reset_prefix_cache", None)
     if reset_prefix_cache is None:
@@ -499,6 +542,7 @@ def _load_policy_into_vllm_fresh(
     reset_succeeded = reset_prefix_cache()
     if reset_succeeded is False:
         raise RuntimeError("vLLM prefix cache could not be reset after loading policy weights.")
+    _progress("vLLM weights synced and prefix cache reset")
 
 
 ##############################
@@ -636,15 +680,23 @@ def main() -> None:
     device_eval = torch.device("cuda:1") if torch.cuda.device_count() > 1 else device
     token = args.hf_token
     alpha = float(alpha_init)
+    _progress(
+        f"run starting: visible_cuda_devices={torch.cuda.device_count()} "
+        f"train={device} eval/vllm={device_eval} profile={args.profile}"
+    )
 
     # --- GPU 0: policy_model (training) ---
+    _progress(f"loading trainable policy: {model_id} -> {device}")
     policy_model = AutoModelForCausalLM.from_pretrained(
         model_id, token=token, torch_dtype=torch.bfloat16
     ).to(device).train()
+    _progress("trainable policy loaded")
     # --- SFT model on eval GPU to free VRAM on train GPU for optimizer states ---
+    _progress(f"loading frozen SFT policy: {sft_model_id} -> {device_eval}")
     sft_model = AutoModelForCausalLM.from_pretrained(
         sft_model_id, token=token, torch_dtype=torch.bfloat16
     ).to(device_eval).eval()
+    _progress("frozen SFT policy loaded")
 
     policy_model.gradient_checkpointing_enable()
     policy_model.config.use_cache = False
@@ -661,17 +713,22 @@ def main() -> None:
         f"vllm_gpu_memory_utilization={vllm_gpu_util}",
         flush=True,
     )
+    _progress("initializing vLLM engine")
     llm = init_vllm(
         model_id=model_id,
         device=str(device_eval),
         seed=args.seed,
         gpu_memory_utilization=vllm_gpu_util,
     )
+    _progress("vLLM engine initialized")
 
+    _progress("loading tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(model_id, token=token)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    _progress("tokenizer loaded")
     if args.wandb_api_key:
+        _progress("logging in to W&B")
         wandb.login(key=args.wandb_api_key)
 
     run_name = (
@@ -679,6 +736,7 @@ def main() -> None:
         f"_lr{learning_rate}_mb{microbatch_size}_ga{gradient_accumulation_steps}"
         f"_n{rollout_batch_size}_seed{args.seed}_MATH3B_copy"
     )
+    _progress(f"initializing W&B run: {run_name}")
     wandb.init(
         project=wandb_project,
         dir=str(PROJECT_ROOT),
@@ -695,6 +753,7 @@ def main() -> None:
             "val_pool_size": n_grpo_steps * val_size,
         },
     )
+    _progress("W&B run initialized")
     profile_output = args.profile_output
     if profile_output is None:
         profile_output = PROJECT_ROOT / "profiles" / f"{run_name}.json"
@@ -724,8 +783,10 @@ def main() -> None:
     total_param_tensors = sum(1 for _ in policy_model.parameters())
 
     # Load MATH dataset for training and eval
+    _progress(f"loading dataset: {hf_dataset}")
     ds_train = load_dataset(hf_dataset, split="train")
     ds_eval = load_dataset(hf_dataset, split="test")
+    _progress("training and test splits loaded")
 
     # Pre-process: filter out examples where extract_math_gold returns None
     raw_train_problems = list(ds_train["problem"])
@@ -738,13 +799,20 @@ def main() -> None:
             train_solutions.append(s)
             train_gold.append(g)
     n_dropped_train = len(raw_train_problems) - len(train_problems)
-    print(f"[Data] Train: dropped {n_dropped_train}/{len(raw_train_problems)} examples with None gold answer")
+    print(
+        f"[Data] Train: dropped {n_dropped_train}/{len(raw_train_problems)} "
+        "examples with None gold answer",
+        flush=True,
+    )
 
     # Double the dataset by repeating
     train_problems = train_problems * 2
     train_solutions = train_solutions * 2
     train_gold = train_gold * 2
-    print(f"[Data] Doubled training data: {len(train_problems)} examples")
+    print(
+        f"[Data] Doubled training data: {len(train_problems)} examples",
+        flush=True,
+    )
     assert val_size <= len(train_problems), (
         "val_size cannot exceed the sequential training-data list"
     )
@@ -759,7 +827,11 @@ def main() -> None:
             eval_solutions.append(s)
             eval_gold.append(g)
     n_dropped_eval = len(raw_eval_problems) - len(eval_problems)
-    print(f"[Data] Eval: dropped {n_dropped_eval}/{len(raw_eval_problems)} examples with None gold answer")
+    print(
+        f"[Data] Eval: dropped {n_dropped_eval}/{len(raw_eval_problems)} "
+        "examples with None gold answer",
+        flush=True,
+    )
 
     eval_prompts = r1_prompts_from_train(eval_problems)
 
@@ -827,6 +899,9 @@ def main() -> None:
         ]
         for step in range(n_grpo_steps)
     ]
+    _progress(
+        f"frozen-reference precompute finished: {val_pool_size} validation occurrences"
+    )
     del (
         flat_reference_outputs,
         flat_reference_correctness,
@@ -840,6 +915,10 @@ def main() -> None:
     train_offset = 0
 
     for grpo_step in range(n_grpo_steps):
+        _progress(
+            f"outer step {grpo_step + 1}/{n_grpo_steps} started: "
+            f"alpha={alpha:.4f} train_offset={train_offset}"
+        )
         profiler.begin_outer_step(grpo_step, optimizer_updates=num_ebs)
         # Get next chunk of training data
         chunk_end = train_offset + n_q_per_rollout_batch
@@ -875,6 +954,10 @@ def main() -> None:
                     batch_size=batch_gen_size,
                     show_progress=not args.profile,
                 )
+        _progress(
+            f"outer step {grpo_step + 1}/{n_grpo_steps}: "
+            f"rollout finished ({len(rollout_responses)} responses)"
+        )
 
         with profiler.phase("reward"):
             advantages, raw_rewards, reward_md = run_compute_group_normalized_rewards(
@@ -898,6 +981,8 @@ def main() -> None:
 
         # old log probs under the mixed behavior policy (theta_old, alpha)
         whole_logp_old_parts: List[torch.Tensor] = []
+        total_logp_chunks = math.ceil(whole_ids.size(0) / logp_chunk_size)
+        last_logp_heartbeat_at = time.perf_counter()
         with profiler.phase("old_logprob"):
             with torch.no_grad():
                 for i in range(0, whole_ids.size(0), logp_chunk_size):
@@ -911,11 +996,29 @@ def main() -> None:
                         alpha=alpha,
                     )["log_probs"]
                     whole_logp_old_parts.append(chunk_logp.cpu())
+                    completed_chunks = i // logp_chunk_size + 1
+                    now = time.perf_counter()
+                    if (
+                        completed_chunks == 1
+                        or completed_chunks == total_logp_chunks
+                        or now - last_logp_heartbeat_at
+                        >= _HEARTBEAT_INTERVAL_SECONDS
+                    ):
+                        _progress(
+                            f"outer step {grpo_step + 1}/{n_grpo_steps}: "
+                            "old-logprob is running: "
+                            f"{completed_chunks}/{total_logp_chunks} chunks complete"
+                        )
+                        last_logp_heartbeat_at = now
             whole_logp_old = torch.cat(whole_logp_old_parts, dim=0)
 
         # iterate effective batches
         global_step_base = grpo_step * num_ebs
         for eb in range(num_ebs):
+            _progress(
+                f"outer step {grpo_step + 1}/{n_grpo_steps}: "
+                f"effective batch {eb + 1}/{num_ebs} started"
+            )
             base = eb * num_egs_per_effective_batch
             end = base + num_egs_per_effective_batch
 
@@ -928,6 +1031,7 @@ def main() -> None:
             entropy_sum = torch.tensor(0.0, device=device)
             mask_elements_sum = torch.tensor(0.0, device=device)
             loss_sum = 0.0
+            last_grad_heartbeat_at = time.perf_counter()
 
             for step in range(gradient_accumulation_steps):
                 s = step * microbatch_size
@@ -965,6 +1069,22 @@ def main() -> None:
                     profile_phase=(profiler.phase if args.profile else None),
                 )
                 loss_sum += eb_loss.detach().item()
+                completed_microbatches = step + 1
+                now = time.perf_counter()
+                if (
+                    completed_microbatches == 1
+                    or completed_microbatches == gradient_accumulation_steps
+                    or now - last_grad_heartbeat_at
+                    >= _HEARTBEAT_INTERVAL_SECONDS
+                ):
+                    _progress(
+                        f"outer step {grpo_step + 1}/{n_grpo_steps}, "
+                        f"effective batch {eb + 1}/{num_ebs}: "
+                        "gradient accumulation is running: "
+                        f"{completed_microbatches}/{gradient_accumulation_steps} "
+                        "microbatches complete"
+                    )
+                    last_grad_heartbeat_at = now
 
             with profiler.phase("grad_metrics"):
                 avg_entropy = entropy_sum / torch.clamp(mask_elements_sum, min=1.0)
@@ -1017,13 +1137,15 @@ def main() -> None:
             print(
                 f"[AdaptiveWeight Trainning] step={global_step} loss={loss_sum:.4f} "
                 f"avg_entropy={avg_entropy.item():.4f} grad_norm={grad_norm.item():.4f} "
-                f"alpha={alpha:.4f}"
+                f"alpha={alpha:.4f}",
+                flush=True,
             )
             print(
                 f"Check gradients! Parameters_all={total_param_tensors} "
                 f"Parameters_gradient={len(grad_params)} "
                 f"sample_update_max={sample_update_max} "
-                f"full_update_max={full_update_max}"
+                f"full_update_max={full_update_max}",
+                flush=True,
             )
             log_entry = {
                 "grpo_step": grpo_step,
@@ -1078,6 +1200,11 @@ def main() -> None:
                     eval_pi_theta = eval_pi_theta_correct / max(1, len(eval_gold))
                     log_entry["eval/accuracy"] = eval_accuracy
                     log_entry["eval_pi_theta"] = eval_pi_theta
+                    _progress(
+                        f"outer step {grpo_step + 1}/{n_grpo_steps}: evaluation finished "
+                        f"mixed_accuracy={eval_accuracy:.4f} "
+                        f"theta_accuracy={eval_pi_theta:.4f}"
+                    )
 
             # Start to log to wandb
             with profiler.phase("logging"):
@@ -1202,7 +1329,12 @@ def main() -> None:
                 step=global_step_base + num_ebs - 1,
                 commit=True,
             )
+        _progress(
+            f"outer step {grpo_step + 1}/{n_grpo_steps} finished: "
+            f"next_alpha={alpha:.4f}"
+        )
 
+    _progress("all training steps finished; finalizing profiling and W&B")
     if args.profile and wandb.run is not None:
         try:
             wandb.run.summary.update(profiler.summary_scalars())
@@ -1242,10 +1374,12 @@ def main() -> None:
     policy_model.config.lapo_reference_model = sft_model_id
     policy_model.config.lapo_controller = "validation_performance_weighted"
     repo_id = f"{hf_username}/{run_name}"
+    _progress(f"pushing final trained policy to Hugging Face: {repo_id}")
     policy_model.push_to_hub(repo_id, token=token, private=False, safe_serialization=True)
+    _progress("model weights uploaded; uploading tokenizer")
     tokenizer.push_to_hub(repo_id, token=token)
-    print(f"Model pushed to HF: {repo_id}")
-    print(f"Final deployed mixed-policy alpha: {alpha:.6f}")
+    print(f"Model pushed to HF: {repo_id}", flush=True)
+    print(f"Final deployed mixed-policy alpha: {alpha:.6f}", flush=True)
 
 
 if __name__ == "__main__":
