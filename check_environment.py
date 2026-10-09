@@ -5,6 +5,7 @@ import argparse
 import ast
 import importlib
 import importlib.util
+import os
 from pathlib import Path
 import sys
 
@@ -14,6 +15,12 @@ ENTRYPOINTS = (
     "Train_MATH_3B_GRPO_KL",
     "Train_MATH_3B_Fixed",
     "Train_MATH_3B_Adaptive",
+    "Train_MATH_3B_Adaptive_ValWeighted",
+)
+REQUIRED_ENV_VARS = (
+    "HF_TOKEN",
+    "WANDB_API_KEY",
+    "HF_USERNAME",
 )
 DEPENDENCIES = (
     "torch", "transformers", "vllm", "datasets", "wandb", "numpy",
@@ -49,6 +56,19 @@ def check_sources() -> bool:
     return not errors
 
 
+def check_required_env_vars() -> bool:
+    missing = [
+        name
+        for name in REQUIRED_ENV_VARS
+        if not os.environ.get(name, "").strip()
+    ]
+    if missing:
+        print("FAIL: missing required environment variables: " + ", ".join(missing))
+        return False
+    print("PASS: required environment variables are set")
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--static-only", action="store_true",
@@ -58,6 +78,8 @@ def main() -> int:
         return 1
     if args.static_only:
         return 0
+    if not check_required_env_vars():
+        return 1
 
     missing = [name for name in DEPENDENCIES if importlib.util.find_spec(name) is None]
     if missing:

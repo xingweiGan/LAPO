@@ -255,7 +255,7 @@ def main() -> None:
         print(f"[SMOKE] Override-1: n_grpo_steps={n_grpo_steps}, rollout_batch_size={rollout_batch_size}, sampling_max_tokens={sampling_max_tokens}", flush=True)
 
     model_id="Qwen/Qwen2.5-3B-Instruct"
-    sft_model_id: str = os.environ["SFT_MODEL_ID"]
+    sft_model_id: str = "xw1234gan/SFT_Qwen2.5-3B-Instruct_MATH"
     device_train, device_eval, use_dual_gpu = _resolve_device_layout("cuda:0")
     print(
         f"[Device] train={device_train}, eval={device_eval}, "

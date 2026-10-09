@@ -11,6 +11,10 @@
     "source": "ProjectII_Merging_clean/Main_MATH.py",
     "source_sha256": "1936e96504f15d47a15d3b1007da0de663c69ad497871b96523a072fd21e3f57"
   },
+  "Train_MATH_3B_Adaptive_ValWeighted.py": {
+    "source": "Train_MATH_3B_Adaptive.py",
+    "source_sha256": "9c31b5a7885fce2b75b6aa089f17a38481a7289c4cd2e72b193b79dbd4646ba8"
+  },
   "math3b_support/SFT_policy.py": {
     "source": "ProjectII_Merging_clean/SFT_policy.py",
     "source_sha256": "45c507ebad94a089f1069174847cad0124f0000591ba4a3f048c2a4706344964"

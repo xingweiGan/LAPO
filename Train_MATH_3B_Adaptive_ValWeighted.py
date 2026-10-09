@@ -1,6 +1,7 @@
 
 # Train a policy with GRPO-style RL while mixing logits with a frozen SFT model.
-# Alpha is FIXED at 0.5 (no adaptive update). Uses 3B models.
+# The mixing weight alpha is updated after each GRPO step by comparing the
+# trainable, mixed, and frozen-SFT policies on the same validation questions.
 #
 # EFFICIENCY version: replaces sequential token-by-token generation with:
 #   - vLLM for policy-only generation (~50-60x speedup)
@@ -8,6 +9,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import sys
@@ -110,6 +112,66 @@ def _is_correct(text: str, gold: str) -> int:
     fmt = 1 if scores.get("format_reward", 0.0) > 0 else 0
     ans = 1 if scores.get("answer_reward", 0.0) > 0 else 0
     return 1 if (fmt == 1 and ans == 1) else 0
+
+
+def _cyclic_indices(start: int, count: int, total: int) -> List[int]:
+    """Return the next ``count`` sequential indices, wrapping at ``total``."""
+    if total <= 0:
+        raise ValueError("Cannot take indices from an empty dataset.")
+    if count <= 0:
+        raise ValueError("count must be positive.")
+    return [(start + offset) % total for offset in range(count)]
+
+
+def _validation_weighted_alpha_update(
+    *,
+    alpha: float,
+    q_theta: float,
+    q_mix: float,
+    q_ref: float,
+    temperature: float,
+    update_rate: float,
+    alpha_min: float,
+    alpha_max: float,
+) -> Dict[str, float]:
+    """Compute the validation-performance-weighted controller update."""
+    if temperature <= 0:
+        raise ValueError("validation controller temperature must be positive.")
+    if not 0 < update_rate <= 1:
+        raise ValueError("alpha update rate must be in (0, 1].")
+    if not 0 < alpha_min < alpha_max < 1:
+        raise ValueError("alpha bounds must satisfy 0 < alpha_min < alpha_max < 1.")
+    if not alpha_min <= alpha <= alpha_max:
+        raise ValueError("current alpha must lie within the configured bounds.")
+    if not all(0.0 <= accuracy <= 1.0 for accuracy in (q_theta, q_mix, q_ref)):
+        raise ValueError("validation accuracies must be in [0, 1].")
+
+    scaled_accuracies = [
+        q_theta / temperature,
+        q_mix / temperature,
+        q_ref / temperature,
+    ]
+    max_scaled_accuracy = max(scaled_accuracies)
+    exp_scores = [
+        math.exp(score - max_scaled_accuracy)
+        for score in scaled_accuracies
+    ]
+    score_sum = sum(exp_scores)
+    w_theta, w_mix, w_ref = [score / score_sum for score in exp_scores]
+
+    # Candidate reference weights are 0 for theta, current alpha for the
+    # mixed policy, and 1 for the frozen reference policy.
+    alpha_target = w_mix * alpha + w_ref
+    alpha_smoothed = (1.0 - update_rate) * alpha + update_rate * alpha_target
+    alpha_new = min(max(alpha_smoothed, alpha_min), alpha_max)
+
+    return {
+        "w_theta": float(w_theta),
+        "w_mix": float(w_mix),
+        "w_ref": float(w_ref),
+        "alpha_target": float(alpha_target),
+        "alpha_new": float(alpha_new),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +279,8 @@ def _mixed_generate_batch_fast(
             logits_theta = out_theta.logits[:, -1, :]
             logits_sft = out_sft.logits[:, -1, :].to(dtype=logits_theta.dtype, device=logits_theta.device)
             mixed_logits = _mix_logits(logits_theta, logits_sft, alpha)
+            if step < min_new_tokens and tokenizer.eos_token_id is not None:
+                mixed_logits[:, tokenizer.eos_token_id] = -torch.inf
 
             if temperature > 0:
                 probs = torch.softmax(mixed_logits / temperature, dim=-1)
@@ -266,6 +330,124 @@ def _mixed_generate_batch_fast(
     return all_outputs
 
 
+@torch.inference_mode()
+def _frozen_generate_batch_fast(
+    prompts: Sequence[str],
+    model: PreTrainedModel,
+    tokenizer: AutoTokenizer,
+    max_new_tokens: int,
+    min_new_tokens: int,
+    temperature: float,
+    stop_sequences: Sequence[str],
+    batch_size: int = 32,
+) -> List[str]:
+    """Generate once from the frozen reference model with KV caching."""
+    all_outputs: List[str] = []
+    model_device = next(model.parameters()).device
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
+    for batch_start in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[batch_start : batch_start + batch_size]
+        batch_len = len(batch_prompts)
+
+        encodings = [tokenizer(prompt, return_tensors="pt") for prompt in batch_prompts]
+        prompt_lengths = [encoding["input_ids"].shape[1] for encoding in encodings]
+        max_prompt_len = max(prompt_lengths)
+
+        input_ids = torch.full(
+            (batch_len, max_prompt_len),
+            pad_id,
+            dtype=torch.long,
+            device=model_device,
+        )
+        attention_mask = torch.zeros(
+            (batch_len, max_prompt_len),
+            dtype=torch.long,
+            device=model_device,
+        )
+        for index, encoding in enumerate(encodings):
+            prompt_len = prompt_lengths[index]
+            input_ids[index, max_prompt_len - prompt_len :] = encoding["input_ids"][0].to(model_device)
+            attention_mask[index, max_prompt_len - prompt_len :] = 1
+
+        generated: List[List[int]] = [[] for _ in range(batch_len)]
+        finished = [False] * batch_len
+        past_key_values = None
+
+        for step in range(max_new_tokens):
+            if step == 0:
+                step_ids = input_ids
+                step_mask = attention_mask
+            else:
+                step_ids = next_token_ids
+                step_mask = torch.cat(
+                    [
+                        attention_mask,
+                        torch.ones(
+                            (batch_len, 1),
+                            dtype=torch.long,
+                            device=model_device,
+                        ),
+                    ],
+                    dim=1,
+                )
+                attention_mask = step_mask
+
+            model_output = model(
+                input_ids=step_ids,
+                attention_mask=step_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            logits = model_output.logits[:, -1, :]
+            if step < min_new_tokens and tokenizer.eos_token_id is not None:
+                logits[:, tokenizer.eos_token_id] = -torch.inf
+            if temperature > 0:
+                probabilities = torch.softmax(logits / temperature, dim=-1)
+                next_token_ids = torch.multinomial(probabilities, num_samples=1)
+            else:
+                next_token_ids = torch.argmax(logits, dim=-1, keepdim=True)
+            past_key_values = model_output.past_key_values
+
+            tokens_flat = next_token_ids.squeeze(-1).tolist()
+            all_done = True
+            for index in range(batch_len):
+                if finished[index]:
+                    continue
+                generated[index].append(tokens_flat[index])
+                if len(generated[index]) >= min_new_tokens:
+                    if tokens_flat[index] == tokenizer.eos_token_id:
+                        finished[index] = True
+                        continue
+                    decoded_so_far = tokenizer.decode(
+                        generated[index],
+                        skip_special_tokens=True,
+                    )
+                    if any(stop in decoded_so_far for stop in stop_sequences):
+                        finished[index] = True
+                        continue
+                all_done = False
+
+            if all_done:
+                break
+
+        for generated_ids in generated:
+            decoded = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            for stop in stop_sequences:
+                if stop in decoded:
+                    decoded = decoded.split(stop)[0] + stop
+                    break
+            all_outputs.append(decoded)
+
+        print(
+            f"[ValWeightedAdaptive] Finished frozen-reference batch "
+            f"{batch_start + batch_len}/{len(prompts)}",
+            flush=True,
+        )
+
+    return all_outputs
+
+
 # ---------------------------------------------------------------------------
 # vLLM policy-only generation helpers
 # ---------------------------------------------------------------------------
@@ -295,6 +477,23 @@ def _vllm_policy_generate(
     return results
 
 
+def _load_policy_into_vllm_fresh(
+    policy_model: PreTrainedModel,
+    llm: LLM,
+) -> None:
+    """Load current policy weights and invalidate KV cache from older weights."""
+    load_policy_into_vllm_instance(policy_model, llm)
+    reset_prefix_cache = getattr(llm, "reset_prefix_cache", None)
+    if reset_prefix_cache is None:
+        raise RuntimeError(
+            "This training script requires vLLM.reset_prefix_cache() after "
+            "loading updated policy weights."
+        )
+    reset_succeeded = reset_prefix_cache()
+    if reset_succeeded is False:
+        raise RuntimeError("vLLM prefix cache could not be reset after loading policy weights.")
+
+
 ##############################
 # TUNING AREA (edit as needed)
 ##############################
@@ -305,8 +504,12 @@ len_normalization = "mean"
 use_std_normalization: bool = True
 advantage_eps: float = 1e-6
 
-alpha_init: float = 0.5  # FIXED — no alpha update in this script
+alpha_init: float = 0.5
 val_size: int = 100
+val_controller_temperature: float = 0.25
+alpha_update_rate: float = 0.50
+alpha_min: float = 0.05
+alpha_max: float = 0.95
 eval_size: int = 500
 update_interval_ebs: int = 8  # K effective batches per GRPO step
 eval_every_effective_batches: int = update_interval_ebs
@@ -324,18 +527,17 @@ gradient_accumulation_steps: int = 128
 microbatch_size: int = num_egs_per_effective_batch // gradient_accumulation_steps
 logp_chunk_size: int = 2
 
-batch_gen_size: int = 32  # sub-batch size for _mixed_generate_batch_fast
+batch_gen_size: int = 8  # sub-batch size for _mixed_generate_batch_fast
 
 model_id = "Qwen/Qwen2.5-3B-Instruct"
 sft_model_id = "xw1234gan/SFT_Qwen2.5-3B-Instruct_MATH"
 hf_dataset = "Maxwell-Jia/MATH"
 
-device_train = "cuda:1"
+device_train = "cuda:0"
 gpu_memory_utilization: float = 0.45
 
 stop_sequence = "</answer>"
 wandb_project = "MATH_3B_comparison"
-checkpoint_dir = "checkpoints/fixed"
 
 
 def _set_reproducibility(seed: int, deterministic: bool) -> None:
@@ -356,7 +558,9 @@ def _set_reproducibility(seed: int, deterministic: bool) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train MATH 3B with fixed logit mixing (alpha=0.5).")
+    parser = argparse.ArgumentParser(
+        description="Train with validation-performance-weighted adaptive mixing and GRPO."
+    )
     parser.add_argument("--hf_token", default=os.environ.get("HF_TOKEN"))
     parser.add_argument("--wandb_api_key", default=os.environ.get("WANDB_API_KEY"))
     parser.add_argument("--seed", type=int, default=42)
@@ -368,6 +572,13 @@ def main() -> None:
     assert num_egs_per_effective_batch % gradient_accumulation_steps == 0, (
         "num_egs_per_effective_batch must be divisible by gradient_accumulation_steps"
     )
+    assert val_size > 0, "val_size must be positive"
+    assert eval_temperature == 0.0, "validation must use greedy decoding"
+    assert val_controller_temperature > 0, "val_controller_temperature must be positive"
+    assert 0 < alpha_update_rate <= 1, "alpha_update_rate must be in (0, 1]"
+    assert 0 < alpha_min < alpha_init < alpha_max < 1, (
+        "alpha bounds must satisfy 0 < alpha_min < alpha_init < alpha_max < 1"
+    )
 
     model_short = model_id.split("/")[-1]
     dataset_short = hf_dataset.split("/")[-1]
@@ -375,8 +586,8 @@ def main() -> None:
     n_q_per_rollout_batch = rollout_batch_size // group_size
     num_ebs = rollout_batch_size // num_egs_per_effective_batch
 
-    device = torch.device(device_train if torch.cuda.device_count() > 1 else "cuda:0")
-    device_eval = torch.device("cuda:0") if torch.cuda.device_count() > 1 else device
+    device = torch.device(device_train)
+    device_eval = torch.device("cuda:1") if torch.cuda.device_count() > 1 else device
     token = args.hf_token
     alpha = float(alpha_init)
 
@@ -418,7 +629,7 @@ def main() -> None:
         wandb.login(key=args.wandb_api_key)
 
     run_name = (
-        f"Extended_Fixed_Merging_{model_short}_{dataset_short}"
+        f"ValWeightedAdaptive_Merging_{model_short}_{dataset_short}"
         f"_lr{learning_rate}_mb{microbatch_size}_ga{gradient_accumulation_steps}"
         f"_n{rollout_batch_size}_seed{args.seed}_MATH3B_copy"
     )
@@ -429,17 +640,15 @@ def main() -> None:
         config={
             "seed": args.seed,
             "deterministic": args.deterministic,
-            "alpha": alpha,
-            "alpha_fixed": True,
+            "alpha_init": alpha_init,
+            "val_size": val_size,
+            "val_controller_temperature": val_controller_temperature,
+            "alpha_update_rate": alpha_update_rate,
+            "alpha_min": alpha_min,
+            "alpha_max": alpha_max,
+            "val_pool_size": n_grpo_steps * val_size,
         },
     )
-
-    os.makedirs(PROJECT_ROOT / checkpoint_dir, exist_ok=True)
-
-    # Checkpoint saving: save 10 times during training
-    total_global_steps = n_grpo_steps * (rollout_batch_size // num_egs_per_effective_batch)
-    checkpoint_interval = total_global_steps // 10
-    checkpoint_count = 0
 
     optimizer = AdamW(policy_model.parameters(), lr=learning_rate, weight_decay=0.0, betas=(0.9, 0.95))
     optimizer.zero_grad()
@@ -467,6 +676,9 @@ def main() -> None:
     train_solutions = train_solutions * 2
     train_gold = train_gold * 2
     print(f"[Data] Doubled training data: {len(train_problems)} examples")
+    assert val_size <= len(train_problems), (
+        "val_size cannot exceed the sequential training-data list"
+    )
 
     raw_eval_problems = list(ds_eval["problem"][:eval_size]) if eval_size > 0 else list(ds_eval["problem"])
     raw_eval_solutions = list(ds_eval["solution"][:eval_size]) if eval_size > 0 else list(ds_eval["solution"])
@@ -481,6 +693,77 @@ def main() -> None:
     print(f"[Data] Eval: dropped {n_dropped_eval}/{len(raw_eval_problems)} examples with None gold answer")
 
     eval_prompts = r1_prompts_from_train(eval_problems)
+
+    # Build the exact sequential validation schedule used by the original
+    # script. Each outer step first consumes its training questions and then
+    # the following val_size questions. The frozen SFT policy is evaluated
+    # once on all scheduled validation occurrences before training begins.
+    validation_indices_by_step: List[List[int]] = []
+    schedule_offset = 0
+    for _ in range(n_grpo_steps):
+        schedule_offset = (
+            schedule_offset + n_q_per_rollout_batch
+        ) % len(train_problems)
+        step_indices = _cyclic_indices(
+            start=schedule_offset,
+            count=val_size,
+            total=len(train_problems),
+        )
+        validation_indices_by_step.append(step_indices)
+        schedule_offset = (schedule_offset + val_size) % len(train_problems)
+
+    val_pool_size = sum(len(indices) for indices in validation_indices_by_step)
+    assert val_pool_size == n_grpo_steps * val_size
+    flat_validation_indices = [
+        index
+        for step_indices in validation_indices_by_step
+        for index in step_indices
+    ]
+    flat_validation_problems = [
+        train_problems[index] for index in flat_validation_indices
+    ]
+    flat_validation_gold = [train_gold[index] for index in flat_validation_indices]
+    flat_validation_prompts = r1_prompts_from_train(flat_validation_problems)
+
+    print(
+        f"[ValWeightedAdaptive] Precomputing frozen-reference correctness "
+        f"for N={val_pool_size} sequential validation occurrences",
+        flush=True,
+    )
+    with _generation_mode(sft_model):
+        flat_reference_outputs = _frozen_generate_batch_fast(
+            prompts=flat_validation_prompts,
+            model=sft_model,
+            tokenizer=tokenizer,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            temperature=eval_temperature,
+            stop_sequences=[stop_sequence],
+            batch_size=batch_gen_size,
+        )
+    if len(flat_reference_outputs) != val_pool_size:
+        raise RuntimeError(
+            "Frozen-reference generation did not return exactly one output "
+            "per scheduled validation occurrence."
+        )
+    flat_reference_correctness = [
+        _is_correct(output, gold)
+        for output, gold in zip(flat_reference_outputs, flat_validation_gold)
+    ]
+    reference_correctness_by_step = [
+        flat_reference_correctness[
+            step * val_size : (step + 1) * val_size
+        ]
+        for step in range(n_grpo_steps)
+    ]
+    del (
+        flat_reference_outputs,
+        flat_reference_correctness,
+        flat_validation_prompts,
+        flat_validation_problems,
+        flat_validation_gold,
+        flat_validation_indices,
+    )
 
     # Training data pointer (cycles through dataset)
     train_offset = 0
@@ -649,14 +932,11 @@ def main() -> None:
                 f"full_update_max={full_update_max}"
             )
             log_entry = {
-                "global_step": global_step,
                 "grpo_step": grpo_step,
                 "effective_batch": eb,
                 "train/loss": loss_sum,
-                "train_loss": loss_sum,
                 "train/avg_entropy": avg_entropy.item(),
                 "train/grad_norm": grad_norm.item(),
-                "alpha": alpha,
                 "train/alpha": alpha,
             }
             # ------------------------------------------------------------
@@ -683,7 +963,7 @@ def main() -> None:
                     )
 
                 # ===== C: Eval pi_theta (500) via vLLM =====
-                load_policy_into_vllm_instance(policy_model, llm)
+                _load_policy_into_vllm_fresh(policy_model, llm)
                 eval_pi_theta_outputs = _vllm_policy_generate(
                     llm=llm,
                     prompts=eval_prompts,
@@ -704,22 +984,121 @@ def main() -> None:
 
             # Start to log to wandb
             print(f"[AdaptiveWeight Wandb] wandb log data: {log_entry}", flush=True)
-            wandb.log(log_entry, step=global_step)
+            wandb.log(
+                log_entry,
+                step=global_step,
+                commit=eb != num_ebs - 1,
+            )
 
-            # Save checkpoint to HF every checkpoint_interval steps
-            if (global_step + 1) % checkpoint_interval == 0:
-                checkpoint_count += 1
-                ckpt_repo = f"{hf_username}/Main_fixed_MATH_3B_step_{checkpoint_count}_MATH3B_copy"
-                print(f"[Checkpoint] Saving checkpoint {checkpoint_count}/10 to {ckpt_repo}", flush=True)
-                policy_model.push_to_hub(ckpt_repo, token=token, private=False, safe_serialization=True)
-                tokenizer.push_to_hub(ckpt_repo, token=token)
-                print(f"[Checkpoint] Saved to {ckpt_repo}", flush=True)
-
-        # Alpha is FIXED at 0.5 — no update
+        # Update alpha using the next sequential validation batch. The current
+        # theta, current mixed policy, and cached frozen SFT are compared on
+        # exactly the same questions.
         print(
-            f"[FixedAlpha] grpo_step={grpo_step} alpha={alpha:.4f} (fixed)",
+            f"[ValWeightedAdaptive updating alpha] at grpo_step={grpo_step} "
+            f"global_step_base={global_step_base} alpha={alpha:.4f}",
             flush=True,
         )
+
+        val_indices = _cyclic_indices(
+            start=train_offset,
+            count=val_size,
+            total=len(train_problems),
+        )
+        expected_indices = validation_indices_by_step[grpo_step]
+        if val_indices != expected_indices:
+            raise RuntimeError(
+                "Sequential validation schedule diverged from the cached "
+                f"reference schedule at grpo_step={grpo_step}."
+            )
+        val_q = [train_problems[index] for index in val_indices]
+        val_gold_list = [train_gold[index] for index in val_indices]
+        c_ref = reference_correctness_by_step[grpo_step]
+        train_offset = (train_offset + val_size) % len(train_problems)
+
+        val_prompts = r1_prompts_from_train(val_q)
+
+        # ===== D: Alpha y_theta (100) via vLLM =====
+        _load_policy_into_vllm_fresh(policy_model, llm)
+        y_theta = _vllm_policy_generate(
+            llm=llm,
+            prompts=val_prompts,
+            temperature=eval_temperature,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            stop_sequences=[stop_sequence],
+        )
+
+        # ===== E: Alpha y_mix (100) via batched mixed gen =====
+        with _generation_mode(policy_model):
+            y_mix = _mixed_generate_batch_fast(
+                prompts=val_prompts,
+                policy_model=policy_model,
+                sft_model=sft_model,
+                tokenizer=tokenizer,
+                device=device,
+                alpha=alpha,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                temperature=eval_temperature,
+                stop_sequences=[stop_sequence],
+                batch_size=batch_gen_size,
+            )
+
+        c_theta = [_is_correct(y, g) for y, g in zip(y_theta, val_gold_list)]
+        c_mix = [_is_correct(y, g) for y, g in zip(y_mix, val_gold_list)]
+        if not (len(c_theta) == len(c_mix) == len(c_ref) == val_size):
+            raise RuntimeError("All three policies must be scored on the same validation batch.")
+
+        q_theta = sum(c_theta) / val_size
+        q_mix = sum(c_mix) / val_size
+        q_ref = sum(c_ref) / val_size
+        alpha_old = alpha
+        controller = _validation_weighted_alpha_update(
+            alpha=alpha_old,
+            q_theta=q_theta,
+            q_mix=q_mix,
+            q_ref=q_ref,
+            temperature=val_controller_temperature,
+            update_rate=alpha_update_rate,
+            alpha_min=alpha_min,
+            alpha_max=alpha_max,
+        )
+        alpha = controller["alpha_new"]
+        print(
+            f"[ValWeightedAdaptive updating alpha] grpo_step={grpo_step} "
+            f"q_theta={q_theta:.4f} q_mix={q_mix:.4f} q_ref={q_ref:.4f} "
+            f"w_theta={controller['w_theta']:.4f} "
+            f"w_mix={controller['w_mix']:.4f} "
+            f"w_ref={controller['w_ref']:.4f} "
+            f"alpha_old={alpha_old:.4f} "
+            f"alpha_target={controller['alpha_target']:.4f} "
+            f"alpha_new={alpha:.4f}",
+            flush=True,
+        )
+        wandb.log(
+            {
+                "alpha/target": controller["alpha_target"],
+                "alpha/new": alpha,
+                "alpha/q_theta": q_theta,
+                "alpha/q_mix": q_mix,
+                "alpha/q_ref": q_ref,
+                "alpha/w_theta": controller["w_theta"],
+                "alpha/w_mix": controller["w_mix"],
+                "alpha/w_ref": controller["w_ref"],
+            },
+            step=global_step_base + num_ebs - 1,
+            commit=True,
+        )
+
+    # Push only the final trained policy to Hugging Face.
+    policy_model.config.lapo_alpha = float(alpha)
+    policy_model.config.lapo_reference_model = sft_model_id
+    policy_model.config.lapo_controller = "validation_performance_weighted"
+    repo_id = f"{hf_username}/{run_name}"
+    policy_model.push_to_hub(repo_id, token=token, private=False, safe_serialization=True)
+    tokenizer.push_to_hub(repo_id, token=token)
+    print(f"Model pushed to HF: {repo_id}")
+    print(f"Final deployed mixed-policy alpha: {alpha:.6f}")
 
     wandb.finish()
 

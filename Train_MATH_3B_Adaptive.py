@@ -329,7 +329,7 @@ logp_chunk_size: int = 2
 batch_gen_size: int = 8  # sub-batch size for _mixed_generate_batch_fast
 
 model_id = "Qwen/Qwen2.5-3B-Instruct"
-sft_model_id = os.environ.get("SFT_MODEL_ID")
+sft_model_id = "xw1234gan/SFT_Qwen2.5-3B-Instruct_MATH"
 hf_dataset = "Maxwell-Jia/MATH"
 
 device_train = "cuda:0"
@@ -365,8 +365,6 @@ def main() -> None:
     parser.add_argument("--deterministic", action="store_true")
     args = parser.parse_args()
     hf_username = os.environ["HF_USERNAME"]
-    if not sft_model_id:
-        raise ValueError("Set SFT_MODEL_ID to the SFT checkpoint repository before training.")
     _set_reproducibility(seed=args.seed, deterministic=args.deterministic)
     assert rollout_batch_size % group_size == 0, "rollout_batch_size must be divisible by group_size"
     assert num_egs_per_effective_batch % gradient_accumulation_steps == 0, (
