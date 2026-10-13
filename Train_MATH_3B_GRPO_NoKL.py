@@ -265,7 +265,7 @@ def main() -> None:
     if args.wandb_api_key:
         wandb.login(key=args.wandb_api_key)
 
-    n_grpo_steps: int = 20
+    n_grpo_steps: int = 40
     advantage_eps: float = 1e-6
     #number of (q,o) pairs per roll out including the redundant questions.
     rollout_batch_size: int = 2048

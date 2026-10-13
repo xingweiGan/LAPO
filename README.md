@@ -96,16 +96,18 @@ Choose one command to start the corresponding training run.
 
 ### Figure 2-5 comparison entrypoints
 
-The comparison scripts follow `Train_<DATASET>_<SIZE>_<METHOD>.py`. They all use
-`group_size=8`, `n_grpo_steps=20`, 2,048 responses per outer step, 256 responses
-per effective batch, gradient accumulation 128, and learning rate `1e-5`.
-Fixed mixing uses `alpha=0.5`; GRPO+KL uses `beta=0.01`; the Figure 3 NoKL
-baseline uses `beta=0`.
+The comparison scripts follow `Train_<DATASET>_<SIZE>_<METHOD>.py`. They use
+`group_size=8`, 2,048 responses per outer step, 256 responses per effective
+batch, gradient accumulation 128, and learning rate `1e-5`. Figure 2, Figure 4,
+and Figure 5 use 20 outer steps. The shared MATH 3B fixed run and the Figure 3
+NoKL baseline use 40 outer steps: Figure 2 uses the first 20 fixed-run results,
+while Figure 3 uses all 40. Fixed mixing uses `alpha=0.5`; GRPO+KL uses
+`beta=0.01`; the Figure 3 NoKL baseline uses `beta=0`.
 
 | Paper figure | Dataset and size | Fixed mixing | GRPO baseline |
 |---|---|---|---|
 | Figure 2 | MATH 1.5B | `Train_MATH_1_5B_Fixed.py` | `Train_MATH_1_5B_GRPO_KL.py` |
-| Figure 2/3 | MATH 3B | `Train_MATH_3B_Fixed.py` | `Train_MATH_3B_GRPO_KL.py`; Figure 3: `Train_MATH_3B_GRPO_NoKL.py` |
+| Figure 2/3 | MATH 3B | `Train_MATH_3B_Fixed.py` (40 steps; Figure 2 uses the first 20) | `Train_MATH_3B_GRPO_KL.py`; Figure 3: `Train_MATH_3B_GRPO_NoKL.py` (40 steps) |
 | Figure 2 | MATH 7B | `Train_MATH_7B_Fixed.py` | `Train_MATH_7B_GRPO_KL.py` |
 | Figure 4 | cn_k12 1.5B | `Train_CNK12_1_5B_Fixed.py` | `Train_CNK12_1_5B_GRPO_KL.py` |
 | Figure 4 | cn_k12 3B | `Train_CNK12_3B_Fixed.py` | `Train_CNK12_3B_GRPO_KL.py` |

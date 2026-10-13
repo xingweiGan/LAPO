@@ -311,7 +311,7 @@ eval_size: int = 500
 update_interval_ebs: int = 8  # K effective batches per GRPO step
 eval_every_effective_batches: int = update_interval_ebs
 
-n_grpo_steps: int = 20
+n_grpo_steps: int = 40
 rollout_temperature: float = 1.0
 eval_temperature: float = 0.0
 min_new_tokens: int = 4
