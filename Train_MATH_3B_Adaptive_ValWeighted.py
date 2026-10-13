@@ -562,17 +562,17 @@ alpha_update_rate: float = 0.50
 alpha_min: float = 0.05
 alpha_max: float = 0.95
 eval_size: int = 500
-update_interval_ebs: int = 8  # K effective batches per GRPO step
+update_interval_ebs: int = 4  # K effective batches per GRPO step
 eval_every_effective_batches: int = update_interval_ebs
 
-n_grpo_steps: int = 40
+n_grpo_steps: int = 20
 rollout_temperature: float = 1.0
 eval_temperature: float = 0.0
 min_new_tokens: int = 4
 max_new_tokens: int = 512
 
 rollout_batch_size: int = 256 * update_interval_ebs
-group_size: int = 8
+group_size: int = 4
 num_egs_per_effective_batch: int = 256
 gradient_accumulation_steps: int = 128
 microbatch_size: int = num_egs_per_effective_batch // gradient_accumulation_steps
