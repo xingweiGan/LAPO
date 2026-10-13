@@ -265,7 +265,7 @@ def main() -> None:
     if args.wandb_api_key:
         wandb.login(key=args.wandb_api_key)
 
-    n_grpo_steps: int = 40
+    n_grpo_steps: int = 20
     advantage_eps: float = 1e-6
     #number of (q,o) pairs per roll out including the redundant questions.
     rollout_batch_size: int = 2048
@@ -353,7 +353,11 @@ def main() -> None:
     # Initialize wandb at the beginning (before the training loop)
     model_short = model_id.split("/")[-1]
     dataset_short = "MATH"
-    run_name = f"Extended_GRPO_KL_{model_short}_{dataset_short}_beta{beta}_lr{learning_rate}_mb{microbatch_size}_ga{gradient_accumulation_steps}_n{rollout_batch_size}_seed42_MATH3B_copy"
+    run_name = (
+        f"Extended_GRPO_KL_{model_short}_{dataset_short}_beta{beta}"
+        f"_lr{learning_rate}_mb{microbatch_size}_ga{gradient_accumulation_steps}"
+        f"_n{rollout_batch_size}_seed42_G{group_size}_outer{n_grpo_steps}"
+    )
     wandb.init(
         project="MATH_3B_comparison",
         dir=str(PROJECT_ROOT),

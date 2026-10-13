@@ -311,7 +311,7 @@ eval_size: int = 500
 update_interval_ebs: int = 8  # K effective batches per GRPO step
 eval_every_effective_batches: int = update_interval_ebs
 
-n_grpo_steps: int = 40
+n_grpo_steps: int = 20
 rollout_temperature: float = 1.0
 eval_temperature: float = 0.0
 min_new_tokens: int = 4
@@ -335,7 +335,6 @@ gpu_memory_utilization: float = 0.45
 
 stop_sequence = "</answer>"
 wandb_project = "MATH_3B_comparison"
-checkpoint_dir = "checkpoints/fixed"
 
 
 def _set_reproducibility(seed: int, deterministic: bool) -> None:
@@ -420,7 +419,8 @@ def main() -> None:
     run_name = (
         f"Extended_Fixed_Merging_{model_short}_{dataset_short}"
         f"_lr{learning_rate}_mb{microbatch_size}_ga{gradient_accumulation_steps}"
-        f"_n{rollout_batch_size}_seed{args.seed}_MATH3B_copy"
+        f"_n{rollout_batch_size}_seed{args.seed}"
+        f"_G{group_size}_outer{n_grpo_steps}"
     )
     wandb.init(
         project=wandb_project,
@@ -433,13 +433,6 @@ def main() -> None:
             "alpha_fixed": True,
         },
     )
-
-    os.makedirs(PROJECT_ROOT / checkpoint_dir, exist_ok=True)
-
-    # Checkpoint saving: save 10 times during training
-    total_global_steps = n_grpo_steps * (rollout_batch_size // num_egs_per_effective_batch)
-    checkpoint_interval = total_global_steps // 10
-    checkpoint_count = 0
 
     optimizer = AdamW(policy_model.parameters(), lr=learning_rate, weight_decay=0.0, betas=(0.9, 0.95))
     optimizer.zero_grad()
@@ -706,15 +699,6 @@ def main() -> None:
             print(f"[AdaptiveWeight Wandb] wandb log data: {log_entry}", flush=True)
             wandb.log(log_entry, step=global_step)
 
-            # Save checkpoint to HF every checkpoint_interval steps
-            if (global_step + 1) % checkpoint_interval == 0:
-                checkpoint_count += 1
-                ckpt_repo = f"{hf_username}/Main_fixed_MATH_3B_step_{checkpoint_count}_MATH3B_copy"
-                print(f"[Checkpoint] Saving checkpoint {checkpoint_count}/10 to {ckpt_repo}", flush=True)
-                policy_model.push_to_hub(ckpt_repo, token=token, private=False, safe_serialization=True)
-                tokenizer.push_to_hub(ckpt_repo, token=token)
-                print(f"[Checkpoint] Saved to {ckpt_repo}", flush=True)
-
         # Alpha is FIXED at 0.5 — no update
         print(
             f"[FixedAlpha] grpo_step={grpo_step} alpha={alpha:.4f} (fixed)",
@@ -722,6 +706,17 @@ def main() -> None:
         )
 
     wandb.finish()
+
+    # Hugging Face is the final external save: upload one final model repository.
+    repo_id = f"{hf_username}/{run_name}"
+    policy_model.push_to_hub(
+        repo_id,
+        token=token,
+        private=False,
+        safe_serialization=True,
+    )
+    tokenizer.push_to_hub(repo_id, token=token)
+    print(f"Model pushed to HF: {repo_id}")
 
 
 if __name__ == "__main__":

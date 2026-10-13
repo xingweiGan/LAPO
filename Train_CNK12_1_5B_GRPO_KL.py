@@ -1,0 +1,16 @@
+"""Figure 4 GRPO+KL baseline on cn_k12 (Qwen2.5-1.5B)."""
+
+
+def main() -> None:
+    from Train_CNK12_3B_GRPO_KL import main as run_training
+
+    run_training(
+        run_model_size_label="1_5B",
+        run_model_id="Qwen/Qwen2.5-1.5B-Instruct",
+        run_sft_model_id="xw1234gan/SFT_Qwen2.5-1.5B-Instruct_cnk12",
+        run_batch_gen_size=8,
+    )
+
+
+if __name__ == "__main__":
+    main()

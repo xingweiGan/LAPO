@@ -58,7 +58,7 @@ them.
 
 ## 2. Run one training script
 
-All five scripts use the Qwen2.5-3B model family and the `Maxwell-Jia/MATH` dataset. The four post-SFT scripts use the fixed SFT checkpoint `xw1234gan/SFT_Qwen2.5-3B-Instruct_MATH`; no additional SFT checkpoint environment variable is required. Each script runs independently.
+The original five entrypoints use the Qwen2.5-3B model family and the `Maxwell-Jia/MATH` dataset. The four post-SFT scripts use the fixed SFT checkpoint `xw1234gan/SFT_Qwen2.5-3B-Instruct_MATH`; no additional SFT checkpoint environment variable is required. Each script runs independently.
 
 SFT (`Train_MATH_3B_SFT.py`): fine-tunes `Qwen/Qwen2.5-3B-Instruct` on the first 768 MATH training examples using the provided solutions as supervised targets. It evaluates with vLLM and uploads the trained model to `${HF_USERNAME}/SFT_Qwen2.5-3B-Instruct_MATH_MATH3B_copy`.
 
@@ -94,10 +94,37 @@ python Train_MATH_3B_Adaptive_ValWeighted.py
 
 Choose one command to start the corresponding training run.
 
+### Figure 2-5 comparison entrypoints
+
+The comparison scripts follow `Train_<DATASET>_<SIZE>_<METHOD>.py`. They all use
+`group_size=8`, `n_grpo_steps=20`, 2,048 responses per outer step, 256 responses
+per effective batch, gradient accumulation 128, and learning rate `1e-5`.
+Fixed mixing uses `alpha=0.5`; GRPO+KL uses `beta=0.01`; the Figure 3 NoKL
+baseline uses `beta=0`.
+
+| Paper figure | Dataset and size | Fixed mixing | GRPO baseline |
+|---|---|---|---|
+| Figure 2 | MATH 1.5B | `Train_MATH_1_5B_Fixed.py` | `Train_MATH_1_5B_GRPO_KL.py` |
+| Figure 2/3 | MATH 3B | `Train_MATH_3B_Fixed.py` | `Train_MATH_3B_GRPO_KL.py`; Figure 3: `Train_MATH_3B_GRPO_NoKL.py` |
+| Figure 2 | MATH 7B | `Train_MATH_7B_Fixed.py` | `Train_MATH_7B_GRPO_KL.py` |
+| Figure 4 | cn_k12 1.5B | `Train_CNK12_1_5B_Fixed.py` | `Train_CNK12_1_5B_GRPO_KL.py` |
+| Figure 4 | cn_k12 3B | `Train_CNK12_3B_Fixed.py` | `Train_CNK12_3B_GRPO_KL.py` |
+| Figure 4 | cn_k12 7B | `Train_CNK12_7B_Fixed.py` | `Train_CNK12_7B_GRPO_KL.py` |
+| Figure 5 | MMLU 1.5B | `Train_MMLU_1_5B_Fixed.py` | `Train_MMLU_1_5B_GRPO_KL.py` |
+| Figure 5 | MMLU 3B | `Train_MMLU_3B_Fixed.py` | `Train_MMLU_3B_GRPO_KL.py` |
+| Figure 5 | MMLU 7B | `Train_MMLU_7B_Fixed.py` | `Train_MMLU_7B_GRPO_KL.py` |
+
+All MATH runs log to `MATH_3B_comparison`; cn_k12 runs log to
+`CNK12_comparison`; MMLU runs log to `MMLU_comparison`. Run names and Hugging
+Face repository names identify the dataset, model size, method, and
+`G8_outer20`. Fixed scripts retain the existing fixed-policy W&B metrics. Both
+Fixed and GRPO scripts upload one final Hugging Face model repository only after
+W&B finishes; GRPO scripts also retain the existing optional profiling metrics.
+
 ## Optional runtime and GPU-memory profiling
 
-Profiling is off by default. Add `--profile` to either the GRPO+KL script or
-the validation-weighted Adaptive script:
+Profiling is off by default. Add `--profile` to any GRPO script or the
+validation-weighted Adaptive script:
 
 ```bash
 python Train_MATH_3B_GRPO_KL.py --profile

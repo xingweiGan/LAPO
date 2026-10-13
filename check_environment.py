@@ -10,13 +10,8 @@ from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parent
-ENTRYPOINTS = (
-    "Train_MATH_3B_SFT",
-    "Train_MATH_3B_GRPO_KL",
-    "Train_MATH_3B_Fixed",
-    "Train_MATH_3B_Adaptive",
-    "Train_MATH_3B_Adaptive_ValWeighted",
-)
+# Keep the environment check aligned with every public training entrypoint.
+ENTRYPOINTS = tuple(path.stem for path in sorted(ROOT.glob("Train_*.py")))
 REQUIRED_ENV_VARS = (
     "HF_TOKEN",
     "WANDB_API_KEY",
