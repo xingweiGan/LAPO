@@ -733,6 +733,7 @@ def main() -> None:
 
     run_name = (
         f"ValWeightedAdaptive_Merging_{model_short}_{dataset_short}"
+        f"_G{group_size}_outer{n_grpo_steps}"
         f"_lr{learning_rate}_mb{microbatch_size}_ga{gradient_accumulation_steps}"
         f"_n{rollout_batch_size}_seed{args.seed}_MATH3B_copy"
     )
